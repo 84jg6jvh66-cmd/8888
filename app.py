@@ -21,9 +21,15 @@ st.markdown('''<style>
 .block-container{padding:.55rem .8rem 2rem;max-width:1500px}.hero{padding:14px 16px;border-radius:16px;background:linear-gradient(135deg,#0f172a,#1e293b);color:#fff;margin-bottom:10px}.hero h1{margin:0;font-size:1.45rem}.muted{color:#94a3b8}.price{font-size:2.25rem;font-weight:800;line-height:1.05}.up{color:#ef4444}.down{color:#22c55e}.card{padding:12px;border:1px solid #334155;border-radius:14px;background:#0b1220}.small{font-size:.82rem;color:#94a3b8}@media(max-width:700px){.block-container{padding:.35rem}.price{font-size:1.9rem}.stButton button{min-height:44px;width:100%}.stTabs [data-baseweb="tab"]{font-size:.85rem}}
 </style>''', unsafe_allow_html=True)
 
-FUTU_HOST=os.getenv('FUTU_HOST', st.secrets.get('FUTU_HOST','127.0.0.1'))
-FUTU_PORT=int(os.getenv('FUTU_PORT', st.secrets.get('FUTU_PORT',11111)))
-FUTU_ENABLED=str(os.getenv('FUTU_ENABLED', st.secrets.get('FUTU_ENABLED','false'))).lower() in ('1','true','yes','on')
+def secret(name, default):
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+FUTU_HOST=os.getenv('FUTU_HOST', secret('FUTU_HOST','127.0.0.1'))
+FUTU_PORT=int(os.getenv('FUTU_PORT', secret('FUTU_PORT',11111)))
+FUTU_ENABLED=str(os.getenv('FUTU_ENABLED', secret('FUTU_ENABLED','false'))).lower() in ('1','true','yes','on')
 
 @st.cache_data(ttl=60, show_spinner=False)
 def yf_history(symbol, period='1y', interval='1d'):
@@ -148,7 +154,11 @@ with st.spinner('正在載入 K 線資料…'):
 if a is None:
     st.error('找不到這支股票的行情資料。若要使用富途即時行情，請先啟動 OpenD 並登入富途帳號；未連線時系統會嘗試使用 Yahoo 歷史資料。')
 else:
-    q=a['quote']; prev=q.get('prev') if q else np.nan; ch=a['price']-prev if q and prev and np.isfinite(prev) else np.nan; pct=ch/prev*100 if np.isfinite(ch) and prev else np.nan
+    q=a.get('quote') or {}
+    if not isinstance(q, dict): q={}
+    prev=q.get('prev', np.nan)
+    ch=a['price']-prev if np.isfinite(prev) else np.nan
+    pct=ch/prev*100 if np.isfinite(ch) and prev != 0 else np.nan
     tabs=st.tabs(['📺 看盤','🧠 技術分析','🚀 自動選股','📊 回測'])
     with tabs[0]:
         c1,c2,c3,c4,c5=st.columns(5)
@@ -157,7 +167,7 @@ else:
         c3.metric('壓力 R1',f"${a['r1']:.2f}" if np.isfinite(a['r1']) else '—')
         c4.metric('Risk / Reward',f"1 : {a['rr']:.2f}" if np.isfinite(a['rr']) else '—')
         c5.metric('趨勢',a['trend'])
-        st.caption(f"行情來源：{q.get('source','Yahoo 歷史/備援')}｜時間：{q.get('time','—') if q else '—'}")
+        st.caption(f"行情來源：{q.get('source', 'Yahoo 歷史/備援')}｜時間：{q.get('time', '—')}")
         chart(a['df'],a['supports'],a['resists'],symbol)
         st.caption('K線上的 S/R 為系統依歷史價格反覆反應自動聚類出的區域；不是保證未來價格會在該處反轉。')
 
@@ -187,23 +197,67 @@ else:
         if st.button('開始掃描',type='primary'):
             rows=[]
             for s in [x.strip().upper() for x in symbols.splitlines() if x.strip()]:
-                z=analyze(s)
-                if not z:continue
-                dd=z['df'].iloc[-1]; dist=(z['price']-z['s1'])/z['price']*100 if np.isfinite(z['s1']) else np.nan; volr=dd['Volume']/dd['VolMA20'] if dd['VolMA20'] else np.nan
-                ok_rr=np.isfinite(z['rr']) and z['rr']>=min_rr; ok_dist=np.isfinite(dist) and dist<=max_dist; ok_vol=np.isfinite(volr) and volr>=min_vol; ok_tr=(z['trend']=='多頭') if only_bull else True
-                if ok_rr and ok_dist and ok_vol and ok_tr: rows.append({'股票':s,'價格':z['price'],'S1':z['s1'],'R1':z['r1'],'距支撐%':dist,'量比':volr,'R/R':z['rr'],'趨勢':z['trend']})
-            out=pd.DataFrame(rows).sort_values('R/R',ascending=False) if rows else pd.DataFrame()
+                try:
+                    z=analyze(s)
+                    if not z: continue
+                    dd=z['df'].iloc[-1]
+                    dist=(z['price']-z['s1'])/z['price']*100 if np.isfinite(z['s1']) and z['price'] else np.nan
+                    volr=dd['Volume']/dd['VolMA20'] if np.isfinite(dd['VolMA20']) and dd['VolMA20'] else np.nan
+                    ok_rr=np.isfinite(z['rr']) and z['rr']>=min_rr
+                    ok_dist=np.isfinite(dist) and dist<=max_dist
+                    ok_vol=np.isfinite(volr) and volr>=min_vol
+                    ok_tr=(z['trend']=='多頭') if only_bull else True
+                    if ok_rr and ok_dist and ok_vol and ok_tr:
+                        rows.append({'股票':s,'價格':z['price'],'S1':z['s1'],'R1':z['r1'],'距支撐%':dist,'量比':volr,'R/R':z['rr'],'趨勢':z['trend']})
+                except Exception:
+                    continue
+            out=pd.DataFrame(rows)
+            if not out.empty and 'R/R' in out.columns: out=out.sort_values('R/R',ascending=False)
             st.session_state['scan']=out
         if 'scan' in st.session_state:
             st.dataframe(st.session_state['scan'],hide_index=True,use_container_width=True)
 
     with tabs[3]:
         st.subheader('📊 歷史條件回測')
-        st.info('V6 先保留 V5 的研究型回測介面；下一階段可把同一套自動 S/R 規則直接用於無未來資料洩漏的歷史回測。')
         entry=st.number_input('假設進場價',min_value=0.01,value=float(a['price']),step=.1)
-        if np.isfinite(a['s1']) and np.isfinite(a['r1']):
-            st.write(f"自動停損參考：**${a['s1']:.2f}**｜目標參考：**${a['r1']:.2f}**｜R/R：**1 : {a['rr']:.2f}**")
-        st.caption('此頁的數字是歷史資料分析結果，不代表未來報酬或勝率。')
+        hold=st.number_input('最多持有交易日',1,60,10,1)
+        target_r=st.number_input('目標 R',0.5,10.0,2.0,0.5)
+        if np.isfinite(a['s1']): st.write(f"目前自動停損參考：**${a['s1']:.2f}**")
+        if st.button('開始回測',type='primary'):
+            d=a['df'].copy()
+            trades=[]
+            for i in range(len(d)-2):
+                hist=d.iloc[:i+1]
+                ss,rr=levels(hist)
+                if not ss or not rr: continue
+                e=float(d['Open'].iloc[i+1])
+                stop=float(ss[0]['price']); target=e+(e-stop)*target_r
+                if not (stop < e < target): continue
+                end=min(i+1+int(hold),len(d)-1); outcome=None; exit_price=None; exit_idx=end
+                for j in range(i+1,end+1):
+                    lo=float(d['Low'].iloc[j]); hi=float(d['High'].iloc[j])
+                    if lo<=stop and hi>=target:
+                        outcome='先觸及停損（保守）'; exit_price=stop; exit_idx=j; break
+                    if lo<=stop:
+                        outcome='停損'; exit_price=stop; exit_idx=j; break
+                    if hi>=target:
+                        outcome='停利'; exit_price=target; exit_idx=j; break
+                if exit_price is None:
+                    exit_price=float(d['Close'].iloc[exit_idx]); outcome='持有期結束'
+                ret=(exit_price-e)/e*100
+                trades.append({'進場日':str(d.index[i+1].date()),'進場':e,'停損':stop,'目標':target,'出場日':str(d.index[exit_idx].date()),'出場':exit_price,'報酬%':ret,'結果':outcome})
+            bt=pd.DataFrame(trades)
+            if bt.empty:
+                st.warning('目前條件沒有形成可回測的有效樣本。請增加歷史期間或降低條件限制。')
+            else:
+                wins=bt['報酬%']>0; losses=bt['報酬%']<0
+                st.metric('樣本數',len(bt)); c1,c2,c3,c4=st.columns(4)
+                c1.metric('勝率',f"{wins.mean()*100:.1f}%")
+                c2.metric('平均盈利',f"{bt.loc[wins,'報酬%'].mean():.2f}%" if wins.any() else '—')
+                c3.metric('平均虧損',f"{bt.loc[losses,'報酬%'].mean():.2f}%" if losses.any() else '—')
+                c4.metric('平均報酬',f"{bt['報酬%'].mean():.2f}%")
+                st.dataframe(bt.tail(100),hide_index=True,use_container_width=True)
+        st.caption('回測只使用當時已知的歷史 K 線來尋找支撐/壓力；同一根 K 線同時觸及停損與停利時採保守的停損處理。歷史結果不代表未來。')
 
 with st.expander('⚙️ 富途 OpenD 連線設定'):
     st.write(f'目前設定：{FUTU_HOST}:{FUTU_PORT}')
