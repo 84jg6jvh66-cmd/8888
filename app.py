@@ -23,8 +23,9 @@ st.markdown('''<style>
 
 FUTU_HOST=os.getenv('FUTU_HOST', st.secrets.get('FUTU_HOST','127.0.0.1'))
 FUTU_PORT=int(os.getenv('FUTU_PORT', st.secrets.get('FUTU_PORT',11111)))
+FUTU_ENABLED=str(os.getenv('FUTU_ENABLED', st.secrets.get('FUTU_ENABLED','false'))).lower() in ('1','true','yes','on')
 
-@st.cache_data(ttl=15, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def yf_history(symbol, period='1y', interval='1d'):
     try:
         df=yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
@@ -36,9 +37,9 @@ def yf_history(symbol, period='1y', interval='1d'):
 
 class FutuProvider:
     def __init__(self): self.ctx=None
-    def available(self): return ft is not None
+    def available(self): return ft is not None and FUTU_ENABLED
     def connect(self):
-        if ft is None:return False
+        if ft is None or not FUTU_ENABLED:return False
         try:
             self.ctx=ft.OpenQuoteContext(host=FUTU_HOST,port=FUTU_PORT)
             return True
@@ -110,25 +111,38 @@ def chart(df,supports,resists,symbol):
     fig.update_layout(height=650,margin=dict(l=10,r=10,t=25,b=10),xaxis_rangeslider_visible=False,legend_orientation='h',template='plotly_dark')
     st.plotly_chart(fig,use_container_width=True,config={'displaylogo':False,'scrollZoom':True})
 
-def analyze(symbol,entry=None):
-    q=provider.quote(symbol)
-    df=provider.kline(symbol,'K_DAY',500)
-    if df.empty: df=yf_history(symbol,'2y','1d')
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_analysis(symbol):
+    # Fast path: historical data first, so the screen can render even when OpenD is not reachable.
+    df=yf_history(symbol,'1y','1d')
+    if df.empty and FUTU_ENABLED:
+        df=provider.kline(symbol,'K_DAY',500)
     if df.empty:return None
     df=add_indicators(df); ss,rr=levels(df)
-    price=float(q['price']) if q and np.isfinite(q['price']) else float(df['Close'].iloc[-1]); s1=ss[0]['price'] if ss else np.nan; r1=rr[0]['price'] if rr else np.nan
-    e=float(entry) if entry and float(entry)>0 else price
-    risk=e-s1 if np.isfinite(s1) else np.nan; reward=r1-e if np.isfinite(r1) else np.nan
+    price=float(df['Close'].iloc[-1]); s1=ss[0]['price'] if ss else np.nan; r1=rr[0]['price'] if rr else np.nan
+    risk=price-s1 if np.isfinite(s1) else np.nan; reward=r1-price if np.isfinite(r1) else np.nan
     rr_ratio=reward/risk if risk>0 and reward>0 else np.nan
     trend='多頭' if df['MA20'].iloc[-1]>df['MA60'].iloc[-1]>df['MA120'].iloc[-1] else ('空頭' if df['MA20'].iloc[-1]<df['MA60'].iloc[-1]<df['MA120'].iloc[-1] else '盤整')
-    return {'symbol':symbol,'quote':q,'df':df,'supports':ss,'resists':rr,'price':price,'s1':s1,'r1':r1,'rr':rr_ratio,'trend':trend}
+    return {'df':df,'supports':ss,'resists':rr,'price':price,'s1':s1,'r1':r1,'rr':rr_ratio,'trend':trend}
+
+def analyze(symbol,entry=None):
+    base=cached_analysis(symbol)
+    if base is None:return None
+    q=None
+    # Only call Futu when explicitly enabled; this prevents a missing OpenD connection from blocking the UI.
+    if FUTU_ENABLED:
+        q=provider.quote(symbol)
+        if q and np.isfinite(q.get('price',np.nan)):
+            base['price']=float(q['price'])
+    base['symbol']=symbol; base['quote']=q
+    return base
 
 st.markdown('<div class="hero"><h1>📈 US Stock Watch V6</h1><div class="muted">富途行情介面 × K線技術分析 × 自動支撐壓力 × 自動選股</div></div>',unsafe_allow_html=True)
 
 symbol=st.text_input('🔎 輸入美股代碼',value=st.session_state.get('symbol','NVDA'),placeholder='例如 NVDA / AAPL / TSLA').strip().upper()
 st.session_state['symbol']=symbol
 
-with st.spinner('正在載入行情與技術分析…'):
+with st.spinner('正在載入 K 線資料…'):
     a=analyze(symbol)
 
 if a is None:
@@ -193,4 +207,4 @@ else:
 
 with st.expander('⚙️ 富途 OpenD 連線設定'):
     st.write(f'目前設定：{FUTU_HOST}:{FUTU_PORT}')
-    st.write('要使用富途即時行情與即時 K 線，請在網站伺服器上啟動 OpenD、登入富途帳號，並讓本網站可以連到該 OpenD。未連線時，V6 會退回 Yahoo 歷史資料。')
+    st.write(f'富途即時行情：{"已啟用" if FUTU_ENABLED else "未啟用（預設快速模式）"}。要啟用請設定 FUTU_ENABLED=true，並在伺服器上啟動 OpenD、登入富途帳號。未啟用時先用 Yahoo 歷史資料快速畫出 K 線與技術分析，不會卡在 OpenD 連線。')
