@@ -41,6 +41,10 @@ except Exception:
 FUTU_TIMEOUT = float(os.getenv('FUTU_CONNECT_TIMEOUT', secret('FUTU_CONNECT_TIMEOUT', '3')))
 
 
+@st.cache_data(ttl=5, show_spinner=False)
+def futu_preflight_cached(host, port, timeout=3):
+    return futu_preflight(host, port, timeout)
+
 def futu_preflight(host, port, timeout=3):
     try:
         with socket.create_connection((host, int(port)), timeout=timeout):
@@ -59,7 +63,7 @@ class FutuProvider:
     def quote(self, symbol):
         if not self.available():
             return None, 'Futu 模式未啟用或 futu-api 未安裝'
-        ok, err = futu_preflight(self.host, self.port, FUTU_TIMEOUT)
+        ok, err = futu_preflight_cached(self.host, self.port, FUTU_TIMEOUT)
         if not ok:
             return None, err
         ctx = None
@@ -98,7 +102,7 @@ class FutuProvider:
     def kline(self, symbol, subtype='K_DAY', limit=500):
         if not self.available():
             return pd.DataFrame(), 'Futu 模式未啟用或 futu-api 未安裝'
-        ok, err = futu_preflight(self.host, self.port, FUTU_TIMEOUT)
+        ok, err = futu_preflight_cached(self.host, self.port, FUTU_TIMEOUT)
         if not ok:
             return pd.DataFrame(), err
         ctx = None
@@ -125,6 +129,33 @@ class FutuProvider:
             except Exception:
                 pass
 
+
+@st.cache_data(ttl=5, show_spinner=False)
+def futu_health():
+    if not FUTU_ENABLED:
+        return {'tcp': False, 'api': False, 'ready': False, 'message': 'FUTU_ENABLED=false'}
+    if not FUTU_IMPORT_OK:
+        return {'tcp': False, 'api': False, 'ready': False, 'message': 'Python futu-api 尚未安裝'}
+    tcp, err = futu_preflight(FUTU_HOST, FUTU_PORT, FUTU_TIMEOUT)
+    if not tcp:
+        return {'tcp': False, 'api': False, 'ready': False, 'message': err or 'OpenD TCP 無法連線'}
+    ctx = None
+    try:
+        ctx = futu.OpenQuoteContext(host=FUTU_HOST, port=FUTU_PORT)
+        ret, state = ctx.get_global_state()
+        if ret != futu.RET_OK or not isinstance(state, dict):
+            return {'tcp': True, 'api': False, 'ready': False, 'message': str(state)}
+        ready = state.get('program_status_type') == 'READY' and bool(state.get('qot_logined'))
+        msg = 'OpenD READY／Quote 已登入' if ready else f"OpenD 狀態：{state.get('program_status_type','未知')}／Quote 登入：{state.get('qot_logined')}"
+        return {'tcp': True, 'api': True, 'ready': ready, 'message': msg, 'state': state}
+    except Exception as e:
+        return {'tcp': True, 'api': False, 'ready': False, 'message': f'Futu API：{e}'}
+    finally:
+        try:
+            if ctx is not None:
+                ctx.close()
+        except Exception:
+            pass
 
 FUTU = FutuProvider(FUTU_HOST, FUTU_PORT)
 
@@ -257,9 +288,16 @@ with st.sidebar:
     st.caption('Futu API 已放寬開戶限制：可用富途牛牛號／註冊手機或 Email 登入 OpenD；首次使用需完成 API 問卷與協議確認。')
     st.write(f'OpenD：`{FUTU_HOST}:{FUTU_PORT}`')
     st.write(f'Futu Python API：{"已安裝" if FUTU_IMPORT_OK else "未安裝"}')
-    if st.button('🔌 測試 OpenD 連線'):
-        ok, err=futu_preflight(FUTU_HOST,FUTU_PORT,FUTU_TIMEOUT)
-        st.success('OpenD TCP 連線正常' if ok else err)
+    if st.button('🔌 測試 Futu OpenD'):
+        futu_health.clear()
+    health = futu_health()
+    if health['ready']:
+        st.success('🟢 Futu 即時行情：已連線')
+        st.caption('OpenD：READY｜Quote：已登入｜Session.ALL 可用')
+    elif health['tcp'] and health['api']:
+        st.warning(f"🟡 Futu 已連線，但狀態尚未 READY：{health['message']}")
+    else:
+        st.error(f"🔴 Futu 尚未連線：{health['message']}")
     st.caption('V8.1 單機版預設：網站與 Futu OpenD 在同一台電腦，使用 127.0.0.1:11111。請先登入並保持 Futu OpenD 開啟。')
 
 symbol=st.text_input('🔎 輸入美股代碼',value=st.session_state.get('symbol','NVDA'),placeholder='NVDA / AAPL / TSLA').strip().upper(); st.session_state['symbol']=symbol
@@ -271,7 +309,7 @@ with st.spinner('載入 K 線與即時行情…'):
     a=analyze(symbol,interval)
 
 if a is None:
-    st.error('找不到行情。請確認股票代碼，並確認 Futu OpenD 已開啟、已登入，且監聽 127.0.0.1:11111。')
+    st.error('找不到行情。請確認股票代碼，以及 Futu OpenD 已開啟、已登入並顯示 READY。若 Futu 暫時無資料，技術分析會嘗試使用 Yahoo 歷史資料備援。')
 else:
     q=a.get('quote') or {}
     tabs=st.tabs(['📺 看盤','🧠 技術分析','🚀 自動選股','📊 回測'])
