@@ -1,10 +1,9 @@
 import os
-import time
-from datetime import datetime, timezone
+import socket
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 import yfinance as yf
 
@@ -14,9 +13,16 @@ try:
 except Exception:
     go = None
 
-st.set_page_config(page_title='US Stock Watch V7', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
+try:
+    import futu
+    FUTU_IMPORT_OK = True
+except Exception:
+    futu = None
+    FUTU_IMPORT_OK = False
+
+st.set_page_config(page_title='US Stock Watch V8', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
 st.markdown('''<style>
-.block-container{padding:.45rem .75rem 2rem;max-width:1500px}.hero{padding:14px 16px;border-radius:16px;background:linear-gradient(135deg,#0f172a,#1e293b);color:#fff;margin-bottom:10px}.hero h1{margin:0;font-size:1.45rem}.muted{color:#94a3b8}.price{font-size:2.25rem;font-weight:800;line-height:1.05}.card{padding:12px;border:1px solid #334155;border-radius:14px;background:#0b1220}.small{font-size:.82rem;color:#94a3b8}@media(max-width:700px){.block-container{padding:.3rem}.price{font-size:1.9rem}.stButton button{min-height:44px;width:100%}.stTabs [data-baseweb="tab"]{font-size:.82rem}}
+.block-container{padding:.45rem .75rem 2rem;max-width:1500px}.hero{padding:14px 16px;border-radius:16px;background:linear-gradient(135deg,#0f172a,#1e293b);color:#fff;margin-bottom:10px}.hero h1{margin:0;font-size:1.45rem}.muted{color:#94a3b8}.price{font-size:2.25rem;font-weight:800;line-height:1.05}.status{padding:8px 12px;border-radius:10px;margin:8px 0}.small{font-size:.82rem;color:#94a3b8}@media(max-width:700px){.block-container{padding:.3rem}.price{font-size:1.9rem}.stButton button{min-height:44px;width:100%}.stTabs [data-baseweb="tab"]{font-size:.82rem}}
 </style>''', unsafe_allow_html=True)
 
 def secret(name, default=''):
@@ -25,72 +31,109 @@ def secret(name, default=''):
     except Exception:
         return default
 
-ALPACA_KEY = os.getenv('ALPACA_API_KEY', secret('ALPACA_API_KEY', ''))
-ALPACA_SECRET = os.getenv('ALPACA_API_SECRET', secret('ALPACA_API_SECRET', ''))
-ALPACA_DATA_URL = os.getenv('ALPACA_DATA_URL', secret('ALPACA_DATA_URL', 'https://data.alpaca.markets'))
-ALPACA_FEED = os.getenv('ALPACA_FEED', secret('ALPACA_FEED', 'iex'))
+FUTU_ENABLED = str(os.getenv('FUTU_ENABLED', secret('FUTU_ENABLED', 'false'))).lower() in ('1','true','yes','on')
+FUTU_HOST = os.getenv('FUTU_HOST', secret('FUTU_HOST', '127.0.0.1'))
+try:
+    FUTU_PORT = int(os.getenv('FUTU_PORT', secret('FUTU_PORT', '11111')))
+except Exception:
+    FUTU_PORT = 11111
+FUTU_TIMEOUT = float(os.getenv('FUTU_CONNECT_TIMEOUT', secret('FUTU_CONNECT_TIMEOUT', '3')))
 
 
-def alpaca_headers():
-    return {'APCA-API-KEY-ID': ALPACA_KEY, 'APCA-API-SECRET-KEY': ALPACA_SECRET}
-
-
-def alpaca_ready():
-    return bool(ALPACA_KEY and ALPACA_SECRET)
-
-
-def alpaca_get(path, params=None, timeout=8):
-    if not alpaca_ready():
-        return None, '尚未設定 Alpaca API Key / Secret'
+def futu_preflight(host, port, timeout=3):
     try:
-        r = requests.get(ALPACA_DATA_URL.rstrip('/') + path, headers=alpaca_headers(), params=params or {}, timeout=timeout)
-        if r.status_code >= 400:
-            return None, f'HTTP {r.status_code}: {r.text[:240]}'
-        return r.json(), None
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True, None
     except Exception as e:
-        return None, str(e)
+        return False, f'{host}:{port} 無法連線：{e}'
 
 
-@st.cache_data(ttl=15, show_spinner=False)
-def alpaca_snapshot(symbol, feed='iex'):
-    data, err = alpaca_get(f'/v2/stocks/{symbol.upper()}/snapshot', {'feed': feed})
-    if err or not data:
-        return None, err
-    q = data.get('latestQuote') or {}
-    t = data.get('latestTrade') or {}
-    daily = data.get('dailyBar') or {}
-    prev = data.get('prevDailyBar') or {}
-    price = t.get('p')
-    if price is None:
-        price = q.get('ap') or q.get('bp')
-    return {
-        'price': float(price) if price is not None else np.nan,
-        'bid': float(q['bp']) if q.get('bp') is not None else np.nan,
-        'ask': float(q['ap']) if q.get('ap') is not None else np.nan,
-        'bid_size': q.get('bs'), 'ask_size': q.get('as'),
-        'volume': float(daily['v']) if daily.get('v') is not None else np.nan,
-        'open': float(daily['o']) if daily.get('o') is not None else np.nan,
-        'high': float(daily['h']) if daily.get('h') is not None else np.nan,
-        'low': float(daily['l']) if daily.get('l') is not None else np.nan,
-        'prev': float(prev['c']) if prev.get('c') is not None else np.nan,
-        'quote_time': q.get('t'), 'trade_time': t.get('t'),
-        'source': f'Alpaca {feed}'
-    }, None
+class FutuProvider:
+    def __init__(self, host, port):
+        self.host, self.port = host, int(port)
 
+    def available(self):
+        return FUTU_ENABLED and FUTU_IMPORT_OK
+
+    def quote(self, symbol):
+        if not self.available():
+            return None, 'Futu 模式未啟用或 futu-api 未安裝'
+        ok, err = futu_preflight(self.host, self.port, FUTU_TIMEOUT)
+        if not ok:
+            return None, err
+        ctx = None
+        try:
+            ctx = futu.OpenQuoteContext(host=self.host, port=self.port)
+            code = f'US.{symbol.upper()}'
+            ret, msg = ctx.subscribe([code], [futu.SubType.QUOTE], subscribe_push=False, session=futu.Session.ALL)
+            if ret != futu.RET_OK:
+                return None, str(msg)
+            ret, data = ctx.get_stock_quote([code])
+            if ret != futu.RET_OK or data is None or data.empty:
+                return None, str(data)
+            r = data.iloc[0]
+            return {
+                'price': float(r.get('last_price', np.nan)),
+                'open': float(r.get('open_price', np.nan)),
+                'high': float(r.get('high_price', np.nan)),
+                'low': float(r.get('low_price', np.nan)),
+                'prev': float(r.get('prev_close_price', np.nan)),
+                'volume': float(r.get('volume', np.nan)),
+                'turnover': float(r.get('turnover', np.nan)),
+                'overnight_change_rate': float(r.get('overnight_change_rate', np.nan)),
+                'overnight_volume': float(r.get('overnight_volume', np.nan)),
+                'time': str(r.get('data_time', '')),
+                'source': 'Futu OpenD / Session.ALL'
+            }, None
+        except Exception as e:
+            return None, f'Futu API：{e}'
+        finally:
+            try:
+                if ctx is not None:
+                    ctx.close()
+            except Exception:
+                pass
+
+    def kline(self, symbol, subtype='K_DAY', limit=500):
+        if not self.available():
+            return pd.DataFrame(), 'Futu 模式未啟用或 futu-api 未安裝'
+        ok, err = futu_preflight(self.host, self.port, FUTU_TIMEOUT)
+        if not ok:
+            return pd.DataFrame(), err
+        ctx = None
+        try:
+            ctx = futu.OpenQuoteContext(host=self.host, port=self.port)
+            code = f'US.{symbol.upper()}'
+            stype = getattr(futu.SubType, subtype)
+            ret, msg = ctx.subscribe([code], [stype], subscribe_push=False, session=futu.Session.ALL)
+            if ret != futu.RET_OK:
+                return pd.DataFrame(), str(msg)
+            ret, data = ctx.get_cur_kline(code, int(limit), stype, futu.AuType.QFQ)
+            if ret != futu.RET_OK or data is None or data.empty:
+                return pd.DataFrame(), str(data)
+            d = data.copy()
+            d['time_key'] = pd.to_datetime(d['time_key'])
+            d = d.rename(columns={'time_key':'Date','open':'Open','high':'High','low':'Low','close':'Close','volume':'Volume'})
+            return d.set_index('Date')[['Open','High','Low','Close','Volume']].sort_index(), None
+        except Exception as e:
+            return pd.DataFrame(), f'Futu K線：{e}'
+        finally:
+            try:
+                if ctx is not None:
+                    ctx.close()
+            except Exception:
+                pass
+
+
+FUTU = FutuProvider(FUTU_HOST, FUTU_PORT)
+
+@st.cache_data(ttl=20, show_spinner=False)
+def futu_quote_cached(symbol):
+    return FUTU.quote(symbol)
 
 @st.cache_data(ttl=30, show_spinner=False)
-def alpaca_bars(symbol, timeframe='1Day', limit=500, feed='iex'):
-    data, err = alpaca_get('/v2/stocks/bars', {'symbols': symbol.upper(), 'timeframe': timeframe, 'limit': limit, 'feed': feed, 'adjustment': 'all', 'sort': 'asc'})
-    if err or not data:
-        return pd.DataFrame(), err
-    rows = (data.get('bars') or {}).get(symbol.upper(), [])
-    if not rows:
-        return pd.DataFrame(), 'Alpaca 沒有回傳 K 線'
-    d = pd.DataFrame(rows)
-    d['Date'] = pd.to_datetime(d['t'], utc=True).dt.tz_convert('America/New_York').dt.tz_localize(None)
-    d = d.rename(columns={'o':'Open','h':'High','l':'Low','c':'Close','v':'Volume'})
-    return d.set_index('Date')[['Open','High','Low','Close','Volume']], None
-
+def futu_kline_cached(symbol, subtype, limit=500):
+    return FUTU.kline(symbol, subtype, limit)
 
 @st.cache_data(ttl=60, show_spinner=False)
 def yf_history(symbol, period='1y', interval='1d'):
@@ -131,16 +174,14 @@ def levels(df, lookback=180, tolerance=0.012):
             hit['prices'].append(p); hit['price']=float(np.mean(hit['prices'])); hit['touches']+=1
         else: clusters.append({'type':typ,'price':p,'prices':[p],'touches':1})
     price=float(d['Close'].iloc[-1])
-    ss=[c for c in clusters if c['type']=='S' and c['price']<price]
-    rr=[c for c in clusters if c['type']=='R' and c['price']>price]
-    ss=sorted(ss,key=lambda c:(-c['touches'],abs(price-c['price'])))[:3]
-    rr=sorted(rr,key=lambda c:(-c['touches'],abs(price-c['price'])))[:3]
+    ss=sorted([c for c in clusters if c['type']=='S' and c['price']<price],key=lambda c:(-c['touches'],abs(price-c['price'])))[:3]
+    rr=sorted([c for c in clusters if c['type']=='R' and c['price']>price],key=lambda c:(-c['touches'],abs(price-c['price'])))[:3]
     return sorted(ss,key=lambda c:c['price'],reverse=True), sorted(rr,key=lambda c:c['price'])
 
 
-def chart(df, supports, resists, symbol):
+def chart(df, supports, resists):
     if go is None: return
-    d=df.tail(220); fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[.78,.22],vertical_spacing=.03)
+    d=df.tail(240); fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[.78,.22],vertical_spacing=.03)
     fig.add_trace(go.Candlestick(x=d.index,open=d.Open,high=d.High,low=d.Low,close=d.Close,name='K線'),row=1,col=1)
     for n in [20,60,120]: fig.add_trace(go.Scatter(x=d.index,y=d[f'MA{n}'],name=f'MA{n}',mode='lines'),row=1,col=1)
     for c in supports: fig.add_hline(y=c['price'],line_dash='dot',annotation_text=f"S {c['price']:.2f} ×{c['touches']}",row=1,col=1)
@@ -151,11 +192,16 @@ def chart(df, supports, resists, symbol):
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def historical_analysis(symbol):
-    df, err = alpaca_bars(symbol, '1Day', 500, ALPACA_FEED)
-    source='Alpaca'
+def historical_analysis(symbol, interval='1d'):
+    df=pd.DataFrame(); source=''
+    if FUTU.available():
+        subtype={'1d':'K_DAY','60m':'K_60M','30m':'K_30M','15m':'K_15M','5m':'K_5M'}.get(interval,'K_DAY')
+        df, ferr=futu_kline_cached(symbol, subtype, 500)
+        if not df.empty: source='Futu OpenD'
     if df.empty:
-        df=yf_history(symbol,'1y','1d'); source='Yahoo 備援'
+        if interval=='1d': df=yf_history(symbol,'2y','1d')
+        elif interval in ('60m','30m','15m','5m'): df=yf_history(symbol,'60d',interval)
+        source='Yahoo 備援' if not df.empty else ''
     if df.empty: return None
     df=add_indicators(df); ss,rr=levels(df); price=float(df['Close'].iloc[-1])
     s1=ss[0]['price'] if ss else np.nan; r1=rr[0]['price'] if rr else np.nan
@@ -165,12 +211,14 @@ def historical_analysis(symbol):
     return {'df':df,'supports':ss,'resists':rr,'price':price,'s1':s1,'r1':r1,'rr':rr_ratio,'trend':trend,'source':source}
 
 
-def analyze(symbol, feed):
-    base=historical_analysis(symbol)
+def analyze(symbol, interval):
+    base=historical_analysis(symbol, interval)
     if base is None: return None
-    q, err=alpaca_snapshot(symbol, feed)
-    if q and np.isfinite(q.get('price',np.nan)): base['price']=q['price']; base['quote']=q; base['quote_error']=None
-    else: base['quote']={}; base['quote_error']=err
+    q, err=futu_quote_cached(symbol) if FUTU.available() else (None, 'Futu OpenD 尚未啟用')
+    if q and np.isfinite(q.get('price',np.nan)):
+        base['price']=q['price']; base['quote']=q; base['quote_error']=None
+    else:
+        base['quote']={}; base['quote_error']=err
     base['symbol']=symbol
     return base
 
@@ -178,8 +226,7 @@ def analyze(symbol, feed):
 def backtest(df, hold=10, target_r=2.0):
     trades=[]
     for i in range(len(df)-2):
-        hist=df.iloc[:i+1]
-        ss,rr=levels(hist)
+        hist=df.iloc[:i+1]; ss,rr=levels(hist)
         if not ss or not rr: continue
         e=float(df['Open'].iloc[i+1]); stop=float(ss[0]['price']); target=e+(e-stop)*target_r
         if not (stop<e<target): continue
@@ -194,38 +241,46 @@ def backtest(df, hold=10, target_r=2.0):
     return pd.DataFrame(trades)
 
 
-def show_quote(q, a, feed):
+def show_quote(q, a):
     prev=q.get('prev',np.nan); price=a['price']; ch=price-prev if np.isfinite(prev) else np.nan; pct=ch/prev*100 if np.isfinite(ch) and prev else np.nan
-    c=st.columns(5); c[0].metric('現價',f'${price:.2f}',f'{pct:+.2f}%' if np.isfinite(pct) else None); c[1].metric('Bid',f"${q.get('bid',np.nan):.2f}" if np.isfinite(q.get('bid',np.nan)) else '—'); c[2].metric('Ask',f"${q.get('ask',np.nan):.2f}" if np.isfinite(q.get('ask',np.nan)) else '—'); c[3].metric('S1',f"${a['s1']:.2f}" if np.isfinite(a['s1']) else '—'); c[4].metric('R1',f"${a['r1']:.2f}" if np.isfinite(a['r1']) else '—')
-    st.caption(f"行情：{q.get('source','—')}｜Feed：{feed}｜最後更新：{q.get('trade_time') or q.get('quote_time') or '—'}")
+    c=st.columns(6); c[0].metric('現價',f'${price:.2f}',f'{pct:+.2f}%' if np.isfinite(pct) else None); c[1].metric('開盤',f"${q.get('open',np.nan):.2f}" if np.isfinite(q.get('open',np.nan)) else '—'); c[2].metric('最高',f"${q.get('high',np.nan):.2f}" if np.isfinite(q.get('high',np.nan)) else '—'); c[3].metric('最低',f"${q.get('low',np.nan):.2f}" if np.isfinite(q.get('low',np.nan)) else '—'); c[4].metric('S1',f"${a['s1']:.2f}" if np.isfinite(a['s1']) else '—'); c[5].metric('R1',f"${a['r1']:.2f}" if np.isfinite(a['r1']) else '—')
+    st.caption(f"行情來源：{q.get('source','—')}｜最後更新：{q.get('time','—')}｜美股 Session.ALL")
+    if np.isfinite(q.get('overnight_change_rate',np.nan)):
+        st.caption(f"Overnight 漲跌幅：{q['overnight_change_rate']:+.2f}%｜Overnight 成交量：{q.get('overnight_volume','—')}")
 
 
-st.markdown('<div class="hero"><h1>📈 US Stock Watch V7</h1><div class="muted">Alpaca 24/5 行情 × K線 × 自動支撐壓力 × 自動選股 × 回測</div></div>', unsafe_allow_html=True)
+st.markdown('<div class="hero"><h1>📈 US Stock Watch V8</h1><div class="muted">Futu OpenD 即時行情 × 美股 Session.ALL × K線 × 自動支撐壓力 × 自動選股 × 回測</div></div>', unsafe_allow_html=True)
 
 with st.sidebar:
-    st.subheader('⚙️ 行情設定')
-    feed=st.selectbox('即時 Feed',['iex','sip','overnight','boats'],index=['iex','sip','overnight','boats'].index(ALPACA_FEED) if ALPACA_FEED in ['iex','sip','overnight','boats'] else 0)
-    st.caption('免費測試可先用 IEX；夜盤選 overnight。是否可用取決於 Alpaca 帳戶方案。')
-    st.success('Alpaca API 已設定' if alpaca_ready() else '尚未設定 Alpaca API')
+    st.subheader('⚙️ 富途行情設定')
+    st.caption('Futu API 已放寬開戶限制：可用富途牛牛號／註冊手機或 Email 登入 OpenD；首次使用需完成 API 問卷與協議確認。')
+    st.write(f'OpenD：`{FUTU_HOST}:{FUTU_PORT}`')
+    st.write(f'Futu Python API：{"已安裝" if FUTU_IMPORT_OK else "未安裝"}')
+    if st.button('🔌 測試 OpenD 連線'):
+        ok, err=futu_preflight(FUTU_HOST,FUTU_PORT,FUTU_TIMEOUT)
+        st.success('OpenD TCP 連線正常' if ok else err)
+    st.caption('正式部署時，網站後端必須能連到 OpenD；若網站與 OpenD 不在同一台機器，不要填 127.0.0.1。')
 
 symbol=st.text_input('🔎 輸入美股代碼',value=st.session_state.get('symbol','NVDA'),placeholder='NVDA / AAPL / TSLA').strip().upper(); st.session_state['symbol']=symbol
+interval=st.selectbox('K線週期',['1d','60m','30m','15m','5m'],index=0,format_func=lambda x:{'1d':'日K','60m':'60分鐘','30m':'30分鐘','15m':'15分鐘','5m':'5分鐘'}[x])
 if not symbol: st.stop()
 
-with st.spinner('載入 K 線與行情…'):
-    a=analyze(symbol,feed)
+# Only call Futu when the user has explicitly enabled it in deployment secrets.
+with st.spinner('載入 K 線與即時行情…'):
+    a=analyze(symbol,interval)
 
 if a is None:
-    st.error('找不到行情。請確認股票代碼，或設定 Alpaca API Key / Secret。')
+    st.error('找不到行情。請確認股票代碼。若要啟用富途即時行情，請在執行網站的環境設定 FUTU_ENABLED=true，並讓後端可以連到已登入的 Futu OpenD。')
 else:
     q=a.get('quote') or {}
     tabs=st.tabs(['📺 看盤','🧠 技術分析','🚀 自動選股','📊 回測'])
     with tabs[0]:
-        if q: show_quote(q,a,feed)
+        if q: show_quote(q,a)
         else:
             st.warning(f"即時行情目前無法取得：{a.get('quote_error','未知錯誤')}。技術分析仍可正常使用。")
-            st.metric('歷史收盤',f"${a['price']:.2f}")
-        chart(a['df'],a['supports'],a['resists'],symbol)
-        st.caption('支撐/壓力是依歷史價格反覆反應自動聚類的區域，不是未來反轉保證。')
+            st.metric('最近 K 線收盤',f"${a['price']:.2f}")
+        chart(a['df'],a['supports'],a['resists'])
+        st.caption('支撐/壓力由歷史價格轉折與反覆反應自動聚類，不代表未來一定反轉。')
 
     with tabs[1]:
         d=a['df'].iloc[-1]; cols=st.columns(7)
@@ -243,12 +298,12 @@ else:
             rows=[]
             for s in [x.strip().upper() for x in symbols.splitlines() if x.strip()]:
                 try:
-                    z=analyze(s,feed)
+                    z=analyze(s,'1d')
                     if not z: continue
                     dd=z['df'].iloc[-1]; dist=(z['price']-z['s1'])/z['price']*100 if np.isfinite(z['s1']) and z['price'] else np.nan; volr=dd['Volume']/dd['VolMA20'] if np.isfinite(dd['VolMA20']) and dd['VolMA20'] else np.nan
                     if np.isfinite(z['rr']) and z['rr']>=min_rr and np.isfinite(dist) and dist<=max_dist and np.isfinite(volr) and volr>=min_vol and (not only_bull or z['trend']=='多頭'):
                         rows.append({'股票':s,'價格':z['price'],'S1':z['s1'],'R1':z['r1'],'距支撐%':dist,'量比':volr,'R/R':z['rr'],'趨勢':z['trend']})
-                except Exception: continue
+                except Exception as e: continue
             st.session_state['scan']=pd.DataFrame(rows)
         if 'scan' in st.session_state: st.dataframe(st.session_state['scan'],hide_index=True,use_container_width=True)
 
@@ -257,15 +312,7 @@ else:
         hold=st.number_input('最多持有交易日',1,60,10,1); target_r=st.number_input('目標 R',0.5,10.0,2.0,0.5); min_samples=st.number_input('最低樣本數',5,1000,30,5)
         if st.button('開始回測',type='primary'):
             bt=backtest(a['df'].copy(),hold,target_r)
-            if len(bt)<min_samples: st.warning(f'有效樣本只有 {len(bt)} 筆，低於你設定的最低樣本數 {min_samples}；不顯示勝率結論。'); st.dataframe(bt.tail(100),hide_index=True,use_container_width=True)
-            elif bt.empty: st.warning('沒有有效樣本。')
-            else:
-                wins=bt['報酬%']>0; losses=bt['報酬%']<0; avg_win=bt.loc[wins,'報酬%'].mean() if wins.any() else 0; avg_loss=abs(bt.loc[losses,'報酬%'].mean()) if losses.any() else 0; winrate=wins.mean(); expectancy=winrate*avg_win-(1-winrate)*avg_loss
-                equity=(1+bt['報酬%']/100).cumprod(); dd=(equity/equity.cummax()-1)*100
-                c=st.columns(5); c[0].metric('樣本數',len(bt)); c[1].metric('勝率',f'{winrate*100:.1f}%'); c[2].metric('平均盈利',f'{avg_win:.2f}%'); c[3].metric('平均虧損',f'-{avg_loss:.2f}%'); c[4].metric('期望值',f'{expectancy:.2f}%')
-                st.metric('最大回撤',f'{dd.min():.2f}%'); st.dataframe(bt.tail(100),hide_index=True,use_container_width=True)
-        st.caption('回測只使用當時已知的歷史資料；同一根 K 線同時碰到停損/停利時採保守停損。歷史結果不代表未來。')
+            if len(bt)<min_samples: st.warning(f'有效樣本只有 {len(bt)} 筆，低於最低樣本數 {min_samples}；不顯示勝率結論。')
+            st.dataframe(bt.tail(100),hide_index=True,use_container_width=True)
 
-with st.expander('🔑 Alpaca 設定說明'):
-    st.code('ALPACA_API_KEY = "你的 Key"\nALPACA_API_SECRET = "你的 Secret"\nALPACA_FEED = "iex"', language='toml')
-    st.write('Streamlit Cloud：把上述三項放到 App 的 Secrets；不要把 Key/Secret 寫進 GitHub。')
+st.divider(); st.caption('V8 資料架構：Futu OpenD 為即時行情/K線來源；Yahoo 僅作為歷史資料備援。技術分析與回測不等於投資建議。')
