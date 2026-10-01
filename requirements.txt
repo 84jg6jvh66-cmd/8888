@@ -1,5 +1,5 @@
-streamlit>=1.39,<2
-yfinance>=0.2.50
-pandas>=2.2
+streamlit>=1.45
+pandas>=2.0
 numpy>=1.26
+yfinance>=0.2.40
 requests>=2.31

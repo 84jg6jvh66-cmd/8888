@@ -1,111 +1,161 @@
-import io,re
-from concurrent.futures import ThreadPoolExecutor,as_completed
-import numpy as np,pandas as pd,requests,streamlit as st,yfinance as yf
-st.set_page_config(page_title='US Stock Expectancy V4',page_icon='📈',layout='wide',initial_sidebar_state='collapsed')
-st.markdown('''<style>.block-container{padding:1rem 1rem 2rem;max-width:1250px}@media(max-width:700px){.block-container{padding:.65rem .5rem 1.5rem}.stButton button{width:100%;min-height:48px;font-size:16px}.stDownloadButton button{width:100%;min-height:46px}}[data-testid="stMetricValue"]{font-size:1.2rem}</style>''',unsafe_allow_html=True)
-UA={'User-Agent':'Mozilla/5.0 (compatible; USStockExpectancy/4.0)'}
-@st.cache_data(ttl=3600,show_spinner=False)
-def load_universe():
-    frames=[]
-    for u in ['https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt','https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt']:
-        r=requests.get(u,headers=UA,timeout=20);r.raise_for_status();df=pd.read_csv(io.StringIO(r.text),sep='|',dtype=str)
-        if 'Symbol' in df:
-            df=df[df.Symbol.notna()&~df.Symbol.str.contains('File Creation|Symbol',na=False)].copy();df['Ticker']=df.Symbol;df['Exchange']='NASDAQ'
-        else:
-            df=df[df['ACT Symbol'].notna()&~df['ACT Symbol'].str.contains('File Creation|ACT Symbol',na=False)].copy();code=df.Exchange.fillna('');df=df[code.isin(['N','A'])].copy();df['Ticker']=df['ACT Symbol'];df['Exchange']=df.Exchange.map({'N':'NYSE','A':'NYSE American'})
-        df['Security Name']=df.get('Security Name',df.get('Security Name',df.iloc[:,1]));frames.append(df[['Ticker','Exchange','Security Name']])
-    out=pd.concat(frames,ignore_index=True);out.Ticker=out.Ticker.str.strip().str.upper().str.replace('.','-',regex=False);out=out.drop_duplicates('Ticker');bad=re.compile(r'(WARRANT|UNIT|RIGHT|NOTE|PREF|PREFERRED|DEBENTURE|BOND)',re.I);return out[~out['Security Name'].fillna('').str.contains(bad,na=False)].sort_values('Ticker').reset_index(drop=True)
-@st.cache_data(ttl=900,show_spinner=False)
-def data(ticker,period='5y'):
+import os, time
+from datetime import datetime, timezone
+import requests
+import streamlit as st
+import pandas as pd
+import numpy as np
+import yfinance as yf
+
+st.set_page_config(page_title='US Stock Expectancy V5', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
+st.markdown('''<style>
+.block-container{padding:.8rem 1rem 2rem;max-width:1400px}.hero{padding:18px;border-radius:18px;background:linear-gradient(135deg,#111827,#1f2937);color:white;margin-bottom:12px}.price{font-size:2.5rem;font-weight:800}.sub{opacity:.75}@media(max-width:700px){.block-container{padding:.55rem}.price{font-size:2rem}.stButton button{width:100%;min-height:46px}}
+[data-testid="stMetricValue"]{font-size:1.18rem}
+</style>''', unsafe_allow_html=True)
+
+ALPACA_KEY = st.secrets.get('ALPACA_API_KEY', os.getenv('ALPACA_API_KEY',''))
+ALPACA_SECRET = st.secrets.get('ALPACA_API_SECRET', os.getenv('ALPACA_API_SECRET',''))
+
+@st.cache_data(ttl=30, show_spinner=False)
+def alpaca_snapshot(symbol, feed='iex'):
+    if not (ALPACA_KEY and ALPACA_SECRET): return None
+    h={'APCA-API-KEY-ID':ALPACA_KEY,'APCA-API-SECRET-KEY':ALPACA_SECRET}
+    try:
+        u=f'https://data.alpaca.markets/v2/stocks/{symbol}/snapshot'
+        r=requests.get(u,headers=h,params={'feed':feed},timeout=8); r.raise_for_status(); z=r.json()
+        return z
+    except Exception: return None
+
+def quote_from_snapshot(z):
+    if not z:return None
+    t=z.get('latestTrade') or {}; q=z.get('latestQuote') or {}; d=z.get('dailyBar') or {}; p=z.get('prevDailyBar') or {}
+    price=float(t.get('p') or d.get('c') or q.get('ap') or 0)
+    prev=float(p.get('c') or 0); change=price-prev if prev else np.nan
+    return {'price':price,'change':change,'pct':change/prev*100 if prev else np.nan,'bid':q.get('bp'),'ask':q.get('ap'),'open':d.get('o'),'high':d.get('h'),'low':d.get('l'),'volume':d.get('v'),'prev':prev,'ts':t.get('t')}
+
+@st.cache_data(ttl=20, show_spinner=False)
+def live_quote(symbol, session='regular'):
+    # Prefer Alpaca. Overnight/extended feeds can be selected by the user.
+    if ALPACA_KEY and ALPACA_SECRET:
+        feed={'regular':'iex','extended':'iex','overnight':'overnight'}.get(session,'iex')
+        q=quote_from_snapshot(alpaca_snapshot(symbol,feed));
+        if q:return q|{'source':'Alpaca','feed':feed}
+    try:
+        z=yf.Ticker(symbol).fast_info
+        p=float(z.get('last_price',0)); prev=float(z.get('previous_close',0))
+        return {'price':p,'change':p-prev,'pct':(p-prev)/prev*100 if prev else np.nan,'bid':None,'ask':None,'open':z.get('open'),'high':z.get('day_high'),'low':z.get('day_low'),'volume':z.get('last_volume'),'prev':prev,'ts':datetime.now(timezone.utc).isoformat(),'source':'Yahoo fallback','feed':'delayed/availability varies'}
+    except Exception:return None
+
+@st.cache_data(ttl=900, show_spinner=False)
+def data(ticker, period='5y'):
     try:
         d=yf.download(ticker,period=period,interval='1d',auto_adjust=True,progress=False,threads=False)
         if d is None or d.empty:return pd.DataFrame()
-        if isinstance(d.columns,pd.MultiIndex):d=d.droplevel(1,axis=1)
-        d.columns=[str(x).title() for x in d.columns];d=d[['Open','High','Low','Close','Volume']].dropna().copy()
+        if isinstance(d.columns,pd.MultiIndex):d.columns=d.columns.get_level_values(0)
+        d.columns=[str(x).title() for x in d.columns]; d=d[['Open','High','Low','Close','Volume']].dropna().copy()
         for n in [5,10,20,60,120]:d[f'MA{n}']=d.Close.rolling(n).mean()
-        prev=d.Close.shift(1);tr=pd.concat([d.High-d.Low,(d.High-prev).abs(),(d.Low-prev).abs()],axis=1).max(axis=1);d['ATR14']=tr.rolling(14).mean();d['VolMA20']=d.Volume.rolling(20).mean();d['Ret20']=d.Close.pct_change(20);d['Ret60']=d.Close.pct_change(60);return d.dropna()
+        prev=d.Close.shift(1); tr=pd.concat([d.High-d.Low,(d.High-prev).abs(),(d.Low-prev).abs()],axis=1).max(axis=1)
+        d['ATR14']=tr.rolling(14).mean(); d['VolMA20']=d.Volume.rolling(20).mean(); return d.dropna()
     except Exception:return pd.DataFrame()
-def pivots(d,kind='low',end_i=None,right=3):
-    end_i=len(d)-1 if end_i is None else min(end_i,len(d)-1);v=d.Low.values if kind=='low' else d.High.values;out=[]
-    for p in range(3,end_i-right+1):
-        w=v[p-3:p+4]
-        if kind=='low' and v[p]==np.min(w) and v[p]<np.min(v[p-3:p]):out.append((p,float(v[p])))
-        elif kind=='high' and v[p]==np.max(w) and v[p]>np.max(v[p+1:p+4]):out.append((p,float(v[p])))
-    return out
-def levels(d,tol=.012,end_i=None):
-    i=len(d)-1 if end_i is None else end_i;p=float(d.Close.iloc[i])
-    def cl(points):
+
+def piv(s,kind):
+    a=s.values;o=[]
+    for i in range(3,len(a)-3):
+        w=a[i-3:i+4]
+        if kind=='low' and a[i]==min(w) and a[i]<min(a[i-3:i]):o.append((i,float(a[i])))
+        if kind=='high' and a[i]==max(w) and a[i]>max(a[i+1:i+4]):o.append((i,float(a[i])))
+    return o
+
+def levels(d,tol=.012):
+    p=float(d.Close.iloc[-1])
+    def cluster(points):
         cs=[]
         for _,v in sorted(points,key=lambda x:x[1]):
-            h=next((c for c in cs if abs(v-c[0])/c[0]<=tol),None)
-            if h:h[1].append(v);h[0]=float(np.mean(h[1]))
+            hit=next((c for c in cs if abs(v-c[0])/c[0]<=tol),None)
+            if hit:hit[1].append(v);hit[0]=float(np.mean(hit[1]))
             else:cs.append([v,[v]])
         return cs
-    s=sorted([c[0] for c in cl(pivots(d,'low',i)) if c[0]<p],reverse=True);r=sorted([c[0] for c in cl(pivots(d,'high',i)) if c[0]>p]);return s,r
-def analyze(ticker,near=.03,rrmin=1.5,tol=.012,period='5y'):
-    d=data(ticker,period)
+    s=sorted([c[0] for c in cluster(piv(d.Low,'low')) if c[0]<p],reverse=True); r=sorted([c[0] for c in cluster(piv(d.High,'high')) if c[0]>p])
+    return s,r
+
+def analyze(ticker,near=.03,rrmin=1.5,tol=.012):
+    d=data(ticker)
     if len(d)<130:return None
-    x=d.iloc[-1];s,r=levels(d,tol);s1=s[0] if s else np.nan;r1=r[0] if r else np.nan;risk=(x.Close-s1)/x.Close if np.isfinite(s1) else np.nan;reward=(r1-x.Close)/x.Close if np.isfinite(r1) else np.nan;rr=reward/risk if np.isfinite(risk) and risk>0 and np.isfinite(reward) else np.nan
-    return {'Ticker':ticker,'Price':float(x.Close),'S1':s1,'R1':r1,'Risk':risk,'Reward':reward,'RR':rr,'Trend':bool(x.Close>x.MA20>x.MA60>x.MA120),'Near':bool(np.isfinite(risk) and risk<=near),'RROK':bool(np.isfinite(rr) and rr>=rrmin),'Vol':float(x.Volume/x.VolMA20),'MA5':float(x.MA5),'MA10':float(x.MA10),'MA20':float(x.MA20),'MA60':float(x.MA60),'MA120':float(x.MA120),'Ret20':float(x.Ret20),'Ret60':float(x.Ret60)}
-def backtest(d,near=.03,rr_mult=1.5,horizon=20,tol=.012):
+    x=d.iloc[-1];s,r=levels(d,tol);s1=s[0] if s else np.nan;r1=r[0] if r else np.nan
+    risk=(x.Close-s1)/x.Close if np.isfinite(s1) else np.nan; reward=(r1-x.Close)/x.Close if np.isfinite(r1) else np.nan
+    rr=reward/risk if np.isfinite(risk) and risk>0 and np.isfinite(reward) else np.nan
+    return {'Ticker':ticker,'Price':float(x.Close),'S1':s1,'R1':r1,'Risk':risk,'Reward':reward,'RR':rr,'Trend':bool(x.Close>x.MA20>x.MA60>x.MA120),'Near':bool(np.isfinite(risk) and risk<=near),'RROK':bool(np.isfinite(rr) and rr>=rrmin),'Vol':float(x.Volume/x.VolMA20),'MA20':float(x.MA20),'MA60':float(x.MA60),'MA120':float(x.MA120)}
+
+def backtest(d,near=.03,rr=1.5,horizon=20):
     rows=[]
     for i in range(130,len(d)-horizon-1):
-        h=d.iloc[:i+1];p=float(h.Close.iloc[-1]);s,r=levels(h,tol)
+        h=d.iloc[:i+1];p=float(h.Close.iloc[-1]);s,r=levels(h)
         if not s or not r or not(p>h.MA20.iloc[-1]>h.MA60.iloc[-1]>h.MA120.iloc[-1]):continue
-        stop=float(s[0]);risk=(p-stop)/p
-        if risk<=0 or risk>near:continue
-        ent=float(d.Open.iloc[i+1])
-        if ent<=stop:continue
-        target=ent+rr_mult*(ent-stop);ex=None;out='timeout'
+        stop=s[0]
+        if (p-stop)/p>near:continue
+        ent=float(d.Open.iloc[i+1]);target=ent+rr*(ent-stop);ex=None;out='timeout'
         for j in range(i+1,min(i+1+horizon,len(d))):
             lo,hi=float(d.Low.iloc[j]),float(d.High.iloc[j])
             if lo<=stop:ex=stop;out='loss';break
             if hi>=target:ex=target;out='win';break
         if ex is None:ex=float(d.Close.iloc[min(i+horizon,len(d)-1)])
-        rows.append({'Date':d.index[i],'Entry':ent,'Stop':stop,'Target':target,'Exit':ex,'Return':ex/ent-1,'Outcome':out})
+        rows.append({'Date':d.index[i],'Entry':ent,'Exit':ex,'Return':ex/ent-1,'Outcome':out})
     return pd.DataFrame(rows)
-def summary(bt):
-    if bt.empty:return {}
-    w=bt.Return>0;wr=float(w.mean());aw=float(bt.loc[w,'Return'].mean()) if w.any() else 0;al=float(-bt.loc[~w,'Return'].mean()) if (~w).any() else 0;eq=(1+bt.Return).cumprod();dd=float((eq/eq.cummax()-1).min());return {'samples':len(bt),'wr':wr,'aw':aw,'al':al,'exp':wr*aw-(1-wr)*al,'dd':dd}
-st.title('📈 美股交易期望值 V4');st.caption('手機優先｜NASDAQ + NYSE 自動股票池｜條件掃描｜防未來洩漏回測｜交易期望值')
+
+st.markdown('<div class="hero"><h1>📈 美股交易期望值 V5</h1><div class="sub">即時／延遲行情 · 24/5 時段架構 · 技術分析 · 掃描 · 回測 · 期望值</div></div>',unsafe_allow_html=True)
 with st.sidebar:
-    st.header('⚙️ V4 設定');period=st.selectbox('歷史資料',['2y','5y','10y','max'],1);near=st.slider('距離支撐 S1 最大',1,10,3)/100;rrmin=st.number_input('最低 Risk/Reward',.5,5.,1.5,.1);tol=st.slider('支撐/壓力聚類',.5,3.,1.2,.1)/100;horizon=st.slider('最長持有日',5,60,20,5);min_samples=st.number_input('回測最低樣本數',5,200,30,5)
-single,scan,test=st.tabs(['🔎 單股','🚀 全市場掃描','📊 回測'])
-with single:
-    t=st.text_input('美股代號','AAPL').upper().strip();c1,c2=st.columns(2);entry=c1.number_input('計畫進場價',.01,100000.,250.,.01);capital=c2.number_input('投入資金',0.,100000000.,10000.,100.)
-    if st.button('開始分析',type='primary'):
-        a=analyze(t,near,rrmin,tol,period)
-        if not a:st.error('找不到足夠歷史資料，請確認代號。')
+    st.header('設定'); period=st.selectbox('歷史資料',['2y','5y','10y','max'],1); near=st.slider('距離支撐 S1 最大',1,10,3)/100; rrmin=st.number_input('最低 Risk/Reward',.5,5.,1.5,.1); tol=st.slider('支撐/壓力聚類',.5,3.,1.2,.1)/100; horizon=st.slider('最長持有日',5,60,20,5)
+    st.divider(); st.caption('即時行情：Alpaca API 優先；未設定金鑰時使用 Yahoo fallback。')
+
+tabs=st.tabs(['⚡ 即時行情','🔎 單股分析','🚀 全市場掃描','📊 回測'])
+
+with tabs[0]:
+    st.subheader('⚡ 即時行情中心')
+    c1,c2,c3=st.columns([2,1,1]); symbol=c1.text_input('股票代號','AAPL',key='live').upper().strip(); session=c2.selectbox('行情時段',['regular','extended','overnight'],format_func=lambda x:{'regular':'正常盤','extended':'盤前／盤後','overnight':'隔夜 24/5'}[x]); refresh=c3.slider('刷新秒數',5,60,10)
+    @st.fragment(run_every=f'{refresh}s')
+    def live_panel():
+        q=live_quote(symbol,session)
+        if not q:st.error('目前無法取得行情。請設定 Alpaca API 金鑰。');return
+        pct=q['pct']; arrow='▲' if pct>=0 else '▼'; cls='positive' if pct>=0 else 'negative'
+        st.markdown(f'<div class="hero"><div class="sub">{symbol} · {q["source"]} · {q["feed"]}</div><div class="price">${q["price"]:,.2f}</div><div>{arrow} {q["change"]:+.2f} ({pct:+.2f}%)</div></div>',unsafe_allow_html=True)
+        a,b,c,d,e,f=st.columns(6); a.metric('Bid',f'${q["bid"]:.2f}' if q['bid'] else '—');b.metric('Ask',f'${q["ask"]:.2f}' if q['ask'] else '—');c.metric('開盤',f'${q["open"]:.2f}' if q['open'] else '—');d.metric('最高',f'${q["high"]:.2f}' if q['high'] else '—');e.metric('最低',f'${q["low"]:.2f}' if q['low'] else '—');f.metric('成交量',f'{q["volume"]:,.0f}' if q['volume'] else '—')
+        st.caption(f'更新：{q["ts"]} · 自動每 {refresh} 秒刷新')
+    live_panel()
+    st.info('24/5 模式依行情供應商的 overnight feed；不同方案可能有即時／延遲差異。')
+
+with tabs[1]:
+    t=st.text_input('美股代號','AAPL',key='single').upper().strip(); c1,c2=st.columns(2); entry=c1.number_input('計畫進場價',.01,100000.,250.,.01); capital=c2.number_input('投入資金',0.,100000000.,10000.,100.)
+    if st.button('開始分析',type='primary',key='singlebtn'):
+        a=analyze(t,near,rrmin,tol); q=live_quote(t,'regular')
+        if not a:st.error('找不到足夠歷史資料。')
         else:
-            c=st.columns(4);c[0].metric('現價',f"${a['Price']:,.2f}");c[1].metric('S1',f"${a['S1']:,.2f}" if np.isfinite(a['S1']) else '—');c[2].metric('R1',f"${a['R1']:,.2f}" if np.isfinite(a['R1']) else '—');c[3].metric('R/R',f"1:{a['RR']:.2f}" if np.isfinite(a['RR']) else '—');c=st.columns(4);c[0].metric('下行風險',f"{a['Risk']*100:.2f}%" if np.isfinite(a['Risk']) else '—');c[1].metric('上行潛力',f"{a['Reward']*100:.2f}%" if np.isfinite(a['Reward']) else '—');c[2].metric('預估股數',f'{int(capital/entry):,}');c[3].metric('20日量能',f"{a['Vol']:.2f}x");st.write(f"均線：MA5 ${a['MA5']:.2f}｜MA10 ${a['MA10']:.2f}｜MA20 ${a['MA20']:.2f}｜MA60 ${a['MA60']:.2f}｜MA120 ${a['MA120']:.2f}");st.write(f"條件：趨勢 {'✓' if a['Trend'] else '✗'}｜接近支撐 {'✓' if a['Near'] else '✗'}｜R/R {'✓' if a['RROK'] else '✗'}｜20日報酬 {a['Ret20']*100:.1f}%｜60日報酬 {a['Ret60']*100:.1f}%");st.line_chart(data(t,period)[['Close','MA20','MA60','MA120']].tail(300))
-with scan:
-    st.subheader('🌎 NASDAQ + NYSE 自動掃描')
-    try:
-        uni=load_universe();c=st.columns(4);c[0].metric('股票池',f'{len(uni):,}');c[1].metric('NASDAQ',f'{(uni.Exchange=="NASDAQ").sum():,}');c[2].metric('NYSE',f'{(uni.Exchange.str.startswith("NYSE")).sum():,}');c[3].metric('資料週期',period)
-    except Exception as e:uni=pd.DataFrame();st.error(f'無法取得股票清單：{e}')
-    if not uni.empty:
-        max_scan=st.slider('本次最多掃描檔數',50,min(3000,len(uni)),500,50);workers=st.slider('並行數',1,10,5);exs=st.multiselect('交易所',sorted(uni.Exchange.unique()),default=[x for x in ['NASDAQ','NYSE'] if x in uni.Exchange.unique()]);q=st.text_input('股票名稱關鍵字','');pool=uni[uni.Exchange.isin(exs)].copy();pool=pool[pool['Security Name'].str.contains(q,case=False,na=False)] if q else pool;pool=pool.head(max_scan);st.caption(f'本次掃描：{len(pool):,} 檔')
-        if st.button('🚀 開始全市場掃描',type='primary'):
-            out=[];bar=st.progress(0);fs={}
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                fs={ex.submit(analyze,s,near,rrmin,tol,period):s for s in pool.Ticker}
-                for n,f in enumerate(as_completed(fs),1):
-                    try:
-                        z=f.result()
-                        if z:out.append(z)
-                    except Exception:pass
-                    if n%10==0 or n==len(fs):bar.progress(n/len(fs))
-            df=pd.DataFrame(out)
-            if df.empty:st.warning('沒有取得有效行情資料。')
-            else:
-                df['Signal']=df.Trend&df.Near&df.RROK;hit=df[df.Signal].sort_values(['RR','Reward'],ascending=False);st.metric('符合條件',len(hit));st.dataframe(hit[['Ticker','Price','S1','R1','Risk','Reward','RR','Vol','MA20','MA60','MA120']],use_container_width=True,hide_index=True);st.download_button('下載掃描 CSV',hit.to_csv(index=False).encode('utf-8-sig'),'v4_market_scan.csv','text/csv')
-with test:
+            price=q['price'] if q else a['Price']; cols=st.columns(5);cols[0].metric('即時現價',f'${price:,.2f}' if q else f'${a["Price"]:,.2f}');cols[1].metric('S1',f'${a["S1"]:,.2f}' if np.isfinite(a['S1']) else '—');cols[2].metric('R1',f'${a["R1"]:,.2f}' if np.isfinite(a['R1']) else '—');cols[3].metric('R/R',f'1:{a["RR"]:.2f}' if np.isfinite(a['RR']) else '—');cols[4].metric('即時漲跌',f'{q["pct"]:+.2f}%' if q else '—')
+            shares=int(capital/entry);st.write(f'預估股數：{shares:,}｜MA20 ${a["MA20"]:.2f}｜MA60 ${a["MA60"]:.2f}｜MA120 ${a["MA120"]:.2f}｜20日量能 {a["Vol"]:.2f}x');d=data(t,period);st.line_chart(d[['Close','MA20','MA60','MA120']].tail(250))
+
+with tabs[2]:
+    st.subheader('🚀 即時／技術掃描'); raw=st.text_area('股票清單（每行一檔）','AAPL\nMSFT\nNVDA\nAMZN\nMETA\nGOOGL\nTSLA\nAVGO\nAMD\nNFLX'); workers=st.slider('並行數',1,10,5,key='workers')
+    if st.button('開始掃描',type='primary',key='scanbtn'):
+        syms=list(dict.fromkeys(x.strip().upper() for x in raw.splitlines() if x.strip()));out=[];bar=st.progress(0)
+        from concurrent.futures import ThreadPoolExecutor,as_completed
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            fs={ex.submit(analyze,s,near,rrmin,tol):s for s in syms}
+            for n,f in enumerate(as_completed(fs),1):
+                try:
+                    z=f.result()
+                    if z:
+                        q=live_quote(z['Ticker'],'regular'); z['LivePrice']=q['price'] if q else z['Price']; z['LivePct']=q['pct'] if q else np.nan;out.append(z)
+                except Exception:pass
+                bar.progress(n/len(fs))
+        df=pd.DataFrame(out)
+        if not df.empty:
+            hit=df[df.Trend&df.Near&df.RROK].sort_values(['RR','Reward'],ascending=False);st.metric('符合技術條件',len(hit));st.dataframe(hit[['Ticker','LivePrice','LivePct','S1','R1','Risk','Reward','RR','Vol']],use_container_width=True,hide_index=True);st.download_button('下載 CSV',hit.to_csv(index=False).encode('utf-8-sig'),'v5_scan.csv','text/csv')
+        else:st.warning('沒有有效資料。')
+
+with tabs[3]:
     t2=st.text_input('回測代號','AAPL',key='bt').upper().strip()
-    if st.button('執行回測',type='primary'):
-        bt=backtest(data(t2,period),near,rrmin,horizon,tol);s=summary(bt)
+    if st.button('執行回測',type='primary',key='btbtn'):
+        d=data(t2,period);bt=backtest(d,near,rrmin,horizon)
         if bt.empty:st.warning('沒有符合條件的歷史案例。')
         else:
-            if len(bt)<min_samples:st.warning(f'只有 {len(bt)} 個案例，低於最低樣本數 {min_samples}；數字僅供研究。')
-            else:st.success(f'樣本數 {len(bt)} 已達最低門檻 {min_samples}。')
-            c=st.columns(5);c[0].metric('案例',s['samples']);c[1].metric('勝率',f"{s['wr']*100:.2f}%");c[2].metric('平均獲利',f"{s['aw']*100:.2f}%");c[3].metric('平均虧損',f"{s['al']*100:.2f}%");c[4].metric('期望值',f"{s['exp']*100:.2f}%");st.metric('最大回撤',f"{s['dd']*100:.2f}%");st.dataframe(bt.tail(150),use_container_width=True,hide_index=True);st.download_button('下載回測 CSV',bt.to_csv(index=False).encode('utf-8-sig'),f'{t2}_v4_backtest.csv','text/csv')
-st.divider();st.caption('V4 為研究工具，不是投資建議。歷史資料目前使用 Yahoo Finance / yfinance；大量正式部署建議改用有明確授權且穩定的行情 API，並加入滑價與交易成本。')
+            w=bt.Return>0;wr=w.mean();aw=bt.loc[w,'Return'].mean() if w.any() else 0;al=-bt.loc[~w,'Return'].mean() if (~w).any() else 0;ex=wr*aw-(1-wr)*al;eq=(1+bt.Return).cumprod();dd=(eq/eq.cummax()-1).min();c=st.columns(5);c[0].metric('案例',len(bt));c[1].metric('勝率',f'{wr*100:.2f}%');c[2].metric('平均獲利',f'{aw*100:.2f}%');c[3].metric('平均虧損',f'{al*100:.2f}%');c[4].metric('期望值',f'{ex*100:.2f}%');st.metric('最大回撤',f'{dd*100:.2f}%');st.dataframe(bt.tail(100),use_container_width=True,hide_index=True);st.download_button('下載回測 CSV',bt.to_csv(index=False).encode('utf-8-sig'),f'{t2}_backtest.csv','text/csv')
+
+st.divider();st.caption('V5：即時行情由 Alpaca 優先提供；未設定金鑰時保留 Yahoo fallback。即時資料的覆蓋範圍、延遲與費用取決於行情供應商方案。技術分析與回測僅供研究。')
