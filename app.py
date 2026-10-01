@@ -31,7 +31,8 @@ def secret(name, default=''):
     except Exception:
         return default
 
-FUTU_ENABLED = str(os.getenv('FUTU_ENABLED', secret('FUTU_ENABLED', 'false'))).lower() in ('1','true','yes','on')
+# V8.1 單機版：永久啟用 Futu OpenD。若需要暫時關閉，可設定 FUTU_ENABLED=false。
+FUTU_ENABLED = str(os.getenv('FUTU_ENABLED', secret('FUTU_ENABLED', 'true'))).lower() in ('1','true','yes','on')
 FUTU_HOST = os.getenv('FUTU_HOST', secret('FUTU_HOST', '127.0.0.1'))
 try:
     FUTU_PORT = int(os.getenv('FUTU_PORT', secret('FUTU_PORT', '11111')))
@@ -259,7 +260,7 @@ with st.sidebar:
     if st.button('🔌 測試 OpenD 連線'):
         ok, err=futu_preflight(FUTU_HOST,FUTU_PORT,FUTU_TIMEOUT)
         st.success('OpenD TCP 連線正常' if ok else err)
-    st.caption('正式部署時，網站後端必須能連到 OpenD；若網站與 OpenD 不在同一台機器，不要填 127.0.0.1。')
+    st.caption('V8.1 單機版預設：網站與 Futu OpenD 在同一台電腦，使用 127.0.0.1:11111。請先登入並保持 Futu OpenD 開啟。')
 
 symbol=st.text_input('🔎 輸入美股代碼',value=st.session_state.get('symbol','NVDA'),placeholder='NVDA / AAPL / TSLA').strip().upper(); st.session_state['symbol']=symbol
 interval=st.selectbox('K線週期',['1d','60m','30m','15m','5m'],index=0,format_func=lambda x:{'1d':'日K','60m':'60分鐘','30m':'30分鐘','15m':'15分鐘','5m':'5分鐘'}[x])
@@ -270,7 +271,7 @@ with st.spinner('載入 K 線與即時行情…'):
     a=analyze(symbol,interval)
 
 if a is None:
-    st.error('找不到行情。請確認股票代碼。若要啟用富途即時行情，請在執行網站的環境設定 FUTU_ENABLED=true，並讓後端可以連到已登入的 Futu OpenD。')
+    st.error('找不到行情。請確認股票代碼，並確認 Futu OpenD 已開啟、已登入，且監聽 127.0.0.1:11111。')
 else:
     q=a.get('quote') or {}
     tabs=st.tabs(['📺 看盤','🧠 技術分析','🚀 自動選股','📊 回測'])
