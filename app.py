@@ -1,5 +1,4 @@
 import os
-import socket
 from datetime import datetime
 
 import numpy as np
@@ -20,7 +19,7 @@ except Exception:
     futu = None
     FUTU_IMPORT_OK = False
 
-st.set_page_config(page_title='US Stock Watch V8', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
+st.set_page_config(page_title='US Stock Watch V8.1 FIXED3', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
 st.markdown('''<style>
 .block-container{padding:.45rem .75rem 2rem;max-width:1500px}.hero{padding:14px 16px;border-radius:16px;background:linear-gradient(135deg,#0f172a,#1e293b);color:#fff;margin-bottom:10px}.hero h1{margin:0;font-size:1.45rem}.muted{color:#94a3b8}.price{font-size:2.25rem;font-weight:800;line-height:1.05}.status{padding:8px 12px;border-radius:10px;margin:8px 0}.small{font-size:.82rem;color:#94a3b8}@media(max-width:700px){.block-container{padding:.3rem}.price{font-size:1.9rem}.stButton button{min-height:44px;width:100%}.stTabs [data-baseweb="tab"]{font-size:.82rem}}
 </style>''', unsafe_allow_html=True)
@@ -41,12 +40,28 @@ except Exception:
 FUTU_TIMEOUT = float(os.getenv('FUTU_CONNECT_TIMEOUT', secret('FUTU_CONNECT_TIMEOUT', '3')))
 
 
-def futu_preflight(host, port, timeout=3):
+def futu_connect_test(host, port):
+    if not FUTU_ENABLED:
+        return False, 'FUTU_ENABLED=false'
+    if not FUTU_IMPORT_OK:
+        return False, 'futu-api 未安裝'
+    ctx = None
     try:
-        with socket.create_connection((host, int(port)), timeout=timeout):
-            return True, None
+        ctx = futu.OpenQuoteContext(host=host, port=int(port))
+        ret, state = ctx.get_global_state()
+        if ret != futu.RET_OK:
+            return False, f'Futu OpenD get_global_state 失敗：{state}'
+        if isinstance(state, dict) and not state.get('qot_logined', False):
+            return False, f'OpenD 可連線，但 Quote 尚未登入：{state}'
+        return True, state
     except Exception as e:
-        return False, f'{host}:{port} 無法連線：{e}'
+        return False, f'Futu API 連線失敗：{e}'
+    finally:
+        try:
+            if ctx is not None:
+                ctx.close()
+        except Exception:
+            pass
 
 
 class FutuProvider:
@@ -59,9 +74,6 @@ class FutuProvider:
     def quote(self, symbol):
         if not self.available():
             return None, 'Futu 模式未啟用或 futu-api 未安裝'
-        ok, err = futu_preflight(self.host, self.port, FUTU_TIMEOUT)
-        if not ok:
-            return None, err
         ctx = None
         try:
             ctx = futu.OpenQuoteContext(host=self.host, port=self.port)
@@ -98,9 +110,6 @@ class FutuProvider:
     def kline(self, symbol, subtype='K_DAY', limit=500):
         if not self.available():
             return pd.DataFrame(), 'Futu 模式未啟用或 futu-api 未安裝'
-        ok, err = futu_preflight(self.host, self.port, FUTU_TIMEOUT)
-        if not ok:
-            return pd.DataFrame(), err
         ctx = None
         try:
             ctx = futu.OpenQuoteContext(host=self.host, port=self.port)
@@ -250,23 +259,26 @@ def show_quote(q, a):
         st.caption(f"Overnight 漲跌幅：{q['overnight_change_rate']:+.2f}%｜Overnight 成交量：{q.get('overnight_volume','—')}")
 
 
-st.markdown('<div class="hero"><h1>📈 US Stock Watch V8</h1><div class="muted">Futu OpenD 即時行情 × 美股 Session.ALL × K線 × 自動支撐壓力 × 自動選股 × 回測</div></div>', unsafe_allow_html=True)
+st.markdown('<div class="hero"><h1>📈 US Stock Watch V8.1 FIXED3</h1><div class="muted">Futu OpenD 即時行情 × 美股 Session.ALL × K線 × 自動支撐壓力 × 自動選股 × 回測</div></div>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.subheader('⚙️ 富途行情設定')
     st.caption('Futu API 已放寬開戶限制：可用富途牛牛號／註冊手機或 Email 登入 OpenD；首次使用需完成 API 問卷與協議確認。')
     st.write(f'OpenD：`{FUTU_HOST}:{FUTU_PORT}`')
     st.write(f'Futu Python API：{"已安裝" if FUTU_IMPORT_OK else "未安裝"}')
-    if st.button('🔌 測試 OpenD 連線'):
-        ok, err=futu_preflight(FUTU_HOST,FUTU_PORT,FUTU_TIMEOUT)
-        st.success('OpenD TCP 連線正常' if ok else err)
-    st.caption('V8.1 單機版預設：網站與 Futu OpenD 在同一台電腦，使用 127.0.0.1:11111。請先登入並保持 Futu OpenD 開啟。')
+    if st.button('🔌 測試 Futu OpenD（API）連線'):
+        ok, info=futu_connect_test(FUTU_HOST,FUTU_PORT)
+        if ok:
+            st.success('🟢 Futu OpenD API 連線正常：Quote 已登入、OpenD READY')
+            st.json(info)
+        else:
+            st.error(f'🔴 {info}')
+    st.caption('V8.1 FIXED3：已移除舊版 TCP preflight，直接使用 Futu Python API。網站固定使用 Port 8511，避免誤開舊版。')
 
 symbol=st.text_input('🔎 輸入美股代碼',value=st.session_state.get('symbol','NVDA'),placeholder='NVDA / AAPL / TSLA').strip().upper(); st.session_state['symbol']=symbol
 interval=st.selectbox('K線週期',['1d','60m','30m','15m','5m'],index=0,format_func=lambda x:{'1d':'日K','60m':'60分鐘','30m':'30分鐘','15m':'15分鐘','5m':'5分鐘'}[x])
 if not symbol: st.stop()
 
-# Only call Futu when the user has explicitly enabled it in deployment secrets.
 with st.spinner('載入 K 線與即時行情…'):
     a=analyze(symbol,interval)
 
