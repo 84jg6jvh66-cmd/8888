@@ -1,5 +1,6 @@
 import os
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 import numpy as np
 import pandas as pd
@@ -37,7 +38,8 @@ try:
     FUTU_PORT = int(os.getenv('FUTU_PORT', secret('FUTU_PORT', '11111')))
 except Exception:
     FUTU_PORT = 11111
-FUTU_TIMEOUT = float(os.getenv('FUTU_CONNECT_TIMEOUT', secret('FUTU_CONNECT_TIMEOUT', '3')))
+FUTU_TIMEOUT = float(os.getenv('FUTU_CONNECT_TIMEOUT', secret('FUTU_CONNECT_TIMEOUT', '5')))
+FUTU_CALL_TIMEOUT = float(os.getenv('FUTU_CALL_TIMEOUT', secret('FUTU_CALL_TIMEOUT', '8')))
 
 
 def futu_connect_test(host, port):
@@ -74,65 +76,90 @@ class FutuProvider:
     def quote(self, symbol):
         if not self.available():
             return None, 'Futu 模式未啟用或 futu-api 未安裝'
-        ctx = None
-        try:
-            ctx = futu.OpenQuoteContext(host=self.host, port=self.port)
-            code = f'US.{symbol.upper()}'
-            ret, msg = ctx.subscribe([code], [futu.SubType.QUOTE], subscribe_push=False, session=futu.Session.ALL)
-            if ret != futu.RET_OK:
-                return None, str(msg)
-            ret, data = ctx.get_stock_quote([code])
-            if ret != futu.RET_OK or data is None or data.empty:
-                return None, str(data)
-            r = data.iloc[0]
-            return {
-                'price': float(r.get('last_price', np.nan)),
-                'open': float(r.get('open_price', np.nan)),
-                'high': float(r.get('high_price', np.nan)),
-                'low': float(r.get('low_price', np.nan)),
-                'prev': float(r.get('prev_close_price', np.nan)),
-                'volume': float(r.get('volume', np.nan)),
-                'turnover': float(r.get('turnover', np.nan)),
-                'overnight_change_rate': float(r.get('overnight_change_rate', np.nan)),
-                'overnight_volume': float(r.get('overnight_volume', np.nan)),
-                'time': str(r.get('data_time', '')),
-                'source': 'Futu OpenD / Session.ALL'
-            }, None
-        except Exception as e:
-            return None, f'Futu API：{e}'
-        finally:
+        def _call():
+            ctx = None
             try:
-                if ctx is not None:
-                    ctx.close()
-            except Exception:
-                pass
+                ctx = futu.OpenQuoteContext(host=self.host, port=self.port)
+                code = f'US.{symbol.upper()}'
+                ret, msg = ctx.subscribe([code], [futu.SubType.QUOTE], subscribe_push=False, session=futu.Session.ALL)
+                if ret != futu.RET_OK:
+                    return None, f'訂閱報價失敗：{msg}'
+                ret, data = ctx.get_stock_quote([code])
+                if ret != futu.RET_OK or data is None or data.empty:
+                    return None, f'取得報價失敗：{data}'
+                r = data.iloc[0]
+                return {
+                    'price': float(r.get('last_price', np.nan)),
+                    'open': float(r.get('open_price', np.nan)),
+                    'high': float(r.get('high_price', np.nan)),
+                    'low': float(r.get('low_price', np.nan)),
+                    'prev': float(r.get('prev_close_price', np.nan)),
+                    'volume': float(r.get('volume', np.nan)),
+                    'turnover': float(r.get('turnover', np.nan)),
+                    'overnight_change_rate': float(r.get('overnight_change_rate', np.nan)),
+                    'overnight_volume': float(r.get('overnight_volume', np.nan)),
+                    'time': str(r.get('data_time', '')),
+                    'source': 'Futu OpenD / Session.ALL'
+                }, None
+            except Exception as e:
+                return None, f'Futu API：{e}'
+            finally:
+                try:
+                    if ctx is not None: ctx.close()
+                except Exception: pass
+        ex = ThreadPoolExecutor(max_workers=1)
+        fut = ex.submit(_call)
+        try:
+            return fut.result(timeout=FUTU_CALL_TIMEOUT)
+        except FutureTimeoutError:
+            fut.cancel()
+            ex.shutdown(wait=False, cancel_futures=True)
+            return None, f'Futu 報價 API 超時（>{FUTU_CALL_TIMEOUT:.0f} 秒）'
+        finally:
+            if not fut.done():
+                ex.shutdown(wait=False, cancel_futures=True)
+            else:
+                ex.shutdown(wait=True, cancel_futures=True)
 
-    def kline(self, symbol, subtype='K_DAY', limit=500):
+
+    def kline(self, symbol, subtype='K_DAY', limit=120):
         if not self.available():
             return pd.DataFrame(), 'Futu 模式未啟用或 futu-api 未安裝'
-        ctx = None
-        try:
-            ctx = futu.OpenQuoteContext(host=self.host, port=self.port)
-            code = f'US.{symbol.upper()}'
-            stype = getattr(futu.SubType, subtype)
-            ret, msg = ctx.subscribe([code], [stype], subscribe_push=False, session=futu.Session.ALL)
-            if ret != futu.RET_OK:
-                return pd.DataFrame(), str(msg)
-            ret, data = ctx.get_cur_kline(code, int(limit), stype, futu.AuType.QFQ)
-            if ret != futu.RET_OK or data is None or data.empty:
-                return pd.DataFrame(), str(data)
-            d = data.copy()
-            d['time_key'] = pd.to_datetime(d['time_key'])
-            d = d.rename(columns={'time_key':'Date','open':'Open','high':'High','low':'Low','close':'Close','volume':'Volume'})
-            return d.set_index('Date')[['Open','High','Low','Close','Volume']].sort_index(), None
-        except Exception as e:
-            return pd.DataFrame(), f'Futu K線：{e}'
-        finally:
+        def _call():
+            ctx = None
             try:
-                if ctx is not None:
-                    ctx.close()
-            except Exception:
-                pass
+                ctx = futu.OpenQuoteContext(host=self.host, port=self.port)
+                code = f'US.{symbol.upper()}'
+                stype = getattr(futu.SubType, subtype)
+                ret, msg = ctx.subscribe([code], [stype], subscribe_push=False, session=futu.Session.ALL)
+                if ret != futu.RET_OK:
+                    return pd.DataFrame(), f'訂閱 K 線失敗：{msg}'
+                ret, data = ctx.get_cur_kline(code, int(limit), stype, futu.AuType.QFQ)
+                if ret != futu.RET_OK or data is None or data.empty:
+                    return pd.DataFrame(), f'取得 K 線失敗：{data}'
+                d = data.copy()
+                d['time_key'] = pd.to_datetime(d['time_key'])
+                d = d.rename(columns={'time_key':'Date','open':'Open','high':'High','low':'Low','close':'Close','volume':'Volume'})
+                return d.set_index('Date')[['Open','High','Low','Close','Volume']].sort_index(), None
+            except Exception as e:
+                return pd.DataFrame(), f'Futu K線：{e}'
+            finally:
+                try:
+                    if ctx is not None: ctx.close()
+                except Exception: pass
+        ex = ThreadPoolExecutor(max_workers=1)
+        fut = ex.submit(_call)
+        try:
+            return fut.result(timeout=FUTU_CALL_TIMEOUT)
+        except FutureTimeoutError:
+            fut.cancel()
+            ex.shutdown(wait=False, cancel_futures=True)
+            return pd.DataFrame(), f'Futu K 線 API 超時（>{FUTU_CALL_TIMEOUT:.0f} 秒）'
+        finally:
+            if not fut.done():
+                ex.shutdown(wait=False, cancel_futures=True)
+            else:
+                ex.shutdown(wait=True, cancel_futures=True)
 
 
 FUTU = FutuProvider(FUTU_HOST, FUTU_PORT)
@@ -142,7 +169,7 @@ def futu_quote_cached(symbol):
     return FUTU.quote(symbol)
 
 @st.cache_data(ttl=30, show_spinner=False)
-def futu_kline_cached(symbol, subtype, limit=500):
+def futu_kline_cached(symbol, subtype, limit=120):
     return FUTU.kline(symbol, subtype, limit)
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -206,13 +233,13 @@ def historical_analysis(symbol, interval='1d'):
     df=pd.DataFrame(); source=''
     if FUTU.available():
         subtype={'1d':'K_DAY','60m':'K_60M','30m':'K_30M','15m':'K_15M','5m':'K_5M'}.get(interval,'K_DAY')
-        df, ferr=futu_kline_cached(symbol, subtype, 500)
+        df, ferr=futu_kline_cached(symbol, subtype, 120)
         if not df.empty: source='Futu OpenD'
     if df.empty:
         if interval=='1d': df=yf_history(symbol,'2y','1d')
         elif interval in ('60m','30m','15m','5m'): df=yf_history(symbol,'60d',interval)
         source='Yahoo 備援' if not df.empty else ''
-    if df.empty: return None
+    if df.empty: return {'df': pd.DataFrame(), 'supports': [], 'resists': [], 'price': np.nan, 's1': np.nan, 'r1': np.nan, 'rr': np.nan, 'trend': '無法取得', 'source': '', 'history_error': ferr if 'ferr' in locals() else '無歷史資料'}
     df=add_indicators(df); ss,rr=levels(df); price=float(df['Close'].iloc[-1])
     s1=ss[0]['price'] if ss else np.nan; r1=rr[0]['price'] if rr else np.nan
     risk=price-s1 if np.isfinite(s1) else np.nan; reward=r1-price if np.isfinite(r1) else np.nan
@@ -279,12 +306,17 @@ symbol=st.text_input('🔎 輸入美股代碼',value=st.session_state.get('symbo
 interval=st.selectbox('K線週期',['1d','60m','30m','15m','5m'],index=0,format_func=lambda x:{'1d':'日K','60m':'60分鐘','30m':'30分鐘','15m':'15分鐘','5m':'5分鐘'}[x])
 if not symbol: st.stop()
 
-with st.spinner('載入 K 線與即時行情…'):
-    a=analyze(symbol,interval)
+status = st.empty()
+status.info(f'正在載入 {symbol}：K 線最多等待 {FUTU_CALL_TIMEOUT:.0f} 秒，逾時會自動切換歷史資料。')
+a=analyze(symbol,interval)
+status.empty()
 
 if a is None:
-    st.error('找不到行情。請確認股票代碼，並確認 Futu OpenD 已開啟、已登入，且監聽 127.0.0.1:11111。')
+    st.error('找不到行情。')
 else:
+    if a.get('df') is None or a.get('df').empty:
+        st.error(f"K 線取得失敗：{a.get('history_error','未知錯誤')}")
+        st.stop()
     q=a.get('quote') or {}
     tabs=st.tabs(['📺 看盤','🧠 技術分析','🚀 自動選股','📊 回測'])
     with tabs[0]:
