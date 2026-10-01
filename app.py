@@ -1,161 +1,196 @@
-import os, time
-from datetime import datetime, timezone
-import requests
-import streamlit as st
-import pandas as pd
+import os
+from datetime import datetime
 import numpy as np
+import pandas as pd
+import streamlit as st
 import yfinance as yf
 
-st.set_page_config(page_title='US Stock Expectancy V5', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
+try:
+    import futu as ft
+except Exception:
+    ft = None
+
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+except Exception:
+    go = None
+
+st.set_page_config(page_title='US Stock Watch V6', page_icon='📈', layout='wide', initial_sidebar_state='collapsed')
 st.markdown('''<style>
-.block-container{padding:.8rem 1rem 2rem;max-width:1400px}.hero{padding:18px;border-radius:18px;background:linear-gradient(135deg,#111827,#1f2937);color:white;margin-bottom:12px}.price{font-size:2.5rem;font-weight:800}.sub{opacity:.75}@media(max-width:700px){.block-container{padding:.55rem}.price{font-size:2rem}.stButton button{width:100%;min-height:46px}}
-[data-testid="stMetricValue"]{font-size:1.18rem}
+.block-container{padding:.55rem .8rem 2rem;max-width:1500px}.hero{padding:14px 16px;border-radius:16px;background:linear-gradient(135deg,#0f172a,#1e293b);color:#fff;margin-bottom:10px}.hero h1{margin:0;font-size:1.45rem}.muted{color:#94a3b8}.price{font-size:2.25rem;font-weight:800;line-height:1.05}.up{color:#ef4444}.down{color:#22c55e}.card{padding:12px;border:1px solid #334155;border-radius:14px;background:#0b1220}.small{font-size:.82rem;color:#94a3b8}@media(max-width:700px){.block-container{padding:.35rem}.price{font-size:1.9rem}.stButton button{min-height:44px;width:100%}.stTabs [data-baseweb="tab"]{font-size:.85rem}}
 </style>''', unsafe_allow_html=True)
 
-ALPACA_KEY = st.secrets.get('ALPACA_API_KEY', os.getenv('ALPACA_API_KEY',''))
-ALPACA_SECRET = st.secrets.get('ALPACA_API_SECRET', os.getenv('ALPACA_API_SECRET',''))
+FUTU_HOST=os.getenv('FUTU_HOST', st.secrets.get('FUTU_HOST','127.0.0.1'))
+FUTU_PORT=int(os.getenv('FUTU_PORT', st.secrets.get('FUTU_PORT',11111)))
 
-@st.cache_data(ttl=30, show_spinner=False)
-def alpaca_snapshot(symbol, feed='iex'):
-    if not (ALPACA_KEY and ALPACA_SECRET): return None
-    h={'APCA-API-KEY-ID':ALPACA_KEY,'APCA-API-SECRET-KEY':ALPACA_SECRET}
+@st.cache_data(ttl=15, show_spinner=False)
+def yf_history(symbol, period='1y', interval='1d'):
     try:
-        u=f'https://data.alpaca.markets/v2/stocks/{symbol}/snapshot'
-        r=requests.get(u,headers=h,params={'feed':feed},timeout=8); r.raise_for_status(); z=r.json()
-        return z
-    except Exception: return None
+        df=yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
+        if isinstance(df.columns,pd.MultiIndex): df=df.xs(symbol, axis=1, level=1)
+        df=df.rename(columns=str.title)
+        return df.dropna(subset=['Open','High','Low','Close']).copy()
+    except Exception:
+        return pd.DataFrame()
 
-def quote_from_snapshot(z):
-    if not z:return None
-    t=z.get('latestTrade') or {}; q=z.get('latestQuote') or {}; d=z.get('dailyBar') or {}; p=z.get('prevDailyBar') or {}
-    price=float(t.get('p') or d.get('c') or q.get('ap') or 0)
-    prev=float(p.get('c') or 0); change=price-prev if prev else np.nan
-    return {'price':price,'change':change,'pct':change/prev*100 if prev else np.nan,'bid':q.get('bp'),'ask':q.get('ap'),'open':d.get('o'),'high':d.get('h'),'low':d.get('l'),'volume':d.get('v'),'prev':prev,'ts':t.get('t')}
+class FutuProvider:
+    def __init__(self): self.ctx=None
+    def available(self): return ft is not None
+    def connect(self):
+        if ft is None:return False
+        try:
+            self.ctx=ft.OpenQuoteContext(host=FUTU_HOST,port=FUTU_PORT)
+            return True
+        except Exception:return False
+    def close(self):
+        try:
+            if self.ctx:self.ctx.close()
+        except Exception:pass
+    def quote(self,symbol):
+        if not self.ctx and not self.connect(): return None
+        code='US.'+symbol.upper()
+        try:
+            ret,data=self.ctx.get_stock_quote([code])
+            if ret!=ft.RET_OK or data.empty:return None
+            r=data.iloc[0]
+            return {'price':float(r.get('last_price',np.nan)),'open':float(r.get('open_price',np.nan)),'high':float(r.get('high_price',np.nan)),'low':float(r.get('low_price',np.nan)),'volume':float(r.get('volume',np.nan)),'prev':float(r.get('last_close',np.nan)),'time':str(r.get('data_time','')),'source':'Futu API'}
+        except Exception:return None
+    def kline(self,symbol,ktype='K_DAY',num=500):
+        if not self.ctx and not self.connect(): return pd.DataFrame()
+        code='US.'+symbol.upper(); kt=getattr(ft.KLType,ktype,ft.KLType.K_DAY)
+        try:
+            ret,data=self.ctx.get_cur_kline(code,num,kt,ft.AuType.QFQ)
+            if ret!=ft.RET_OK:return pd.DataFrame()
+            d=data.rename(columns={'time_key':'Date','open':'Open','high':'High','low':'Low','close':'Close','volume':'Volume'})
+            d['Date']=pd.to_datetime(d['Date']); d=d.set_index('Date')
+            return d[['Open','High','Low','Close','Volume']].copy()
+        except Exception:return pd.DataFrame()
 
-@st.cache_data(ttl=20, show_spinner=False)
-def live_quote(symbol, session='regular'):
-    # Prefer Alpaca. Overnight/extended feeds can be selected by the user.
-    if ALPACA_KEY and ALPACA_SECRET:
-        feed={'regular':'iex','extended':'iex','overnight':'overnight'}.get(session,'iex')
-        q=quote_from_snapshot(alpaca_snapshot(symbol,feed));
-        if q:return q|{'source':'Alpaca','feed':feed}
-    try:
-        z=yf.Ticker(symbol).fast_info
-        p=float(z.get('last_price',0)); prev=float(z.get('previous_close',0))
-        return {'price':p,'change':p-prev,'pct':(p-prev)/prev*100 if prev else np.nan,'bid':None,'ask':None,'open':z.get('open'),'high':z.get('day_high'),'low':z.get('day_low'),'volume':z.get('last_volume'),'prev':prev,'ts':datetime.now(timezone.utc).isoformat(),'source':'Yahoo fallback','feed':'delayed/availability varies'}
-    except Exception:return None
+provider=FutuProvider()
 
-@st.cache_data(ttl=900, show_spinner=False)
-def data(ticker, period='5y'):
-    try:
-        d=yf.download(ticker,period=period,interval='1d',auto_adjust=True,progress=False,threads=False)
-        if d is None or d.empty:return pd.DataFrame()
-        if isinstance(d.columns,pd.MultiIndex):d.columns=d.columns.get_level_values(0)
-        d.columns=[str(x).title() for x in d.columns]; d=d[['Open','High','Low','Close','Volume']].dropna().copy()
-        for n in [5,10,20,60,120]:d[f'MA{n}']=d.Close.rolling(n).mean()
-        prev=d.Close.shift(1); tr=pd.concat([d.High-d.Low,(d.High-prev).abs(),(d.Low-prev).abs()],axis=1).max(axis=1)
-        d['ATR14']=tr.rolling(14).mean(); d['VolMA20']=d.Volume.rolling(20).mean(); return d.dropna()
-    except Exception:return pd.DataFrame()
+def add_indicators(df):
+    d=df.copy()
+    for n in [5,10,20,60,120]: d[f'MA{n}']=d['Close'].rolling(n).mean()
+    tr=pd.concat([d['High']-d['Low'],(d['High']-d['Close'].shift()).abs(),(d['Low']-d['Close'].shift()).abs()],axis=1).max(axis=1)
+    d['ATR14']=tr.rolling(14).mean(); d['VolMA20']=d['Volume'].rolling(20).mean()
+    delta=d['Close'].diff(); gain=delta.clip(lower=0).rolling(14).mean(); loss=(-delta.clip(upper=0)).rolling(14).mean(); rs=gain/loss.replace(0,np.nan); d['RSI14']=100-(100/(1+rs))
+    ema12=d['Close'].ewm(span=12,adjust=False).mean(); ema26=d['Close'].ewm(span=26,adjust=False).mean(); d['MACD']=ema12-ema26; d['MACDSignal']=d['MACD'].ewm(span=9,adjust=False).mean()
+    return d
 
-def piv(s,kind):
-    a=s.values;o=[]
-    for i in range(3,len(a)-3):
-        w=a[i-3:i+4]
-        if kind=='low' and a[i]==min(w) and a[i]<min(a[i-3:i]):o.append((i,float(a[i])))
-        if kind=='high' and a[i]==max(w) and a[i]>max(a[i+1:i+4]):o.append((i,float(a[i])))
-    return o
+def levels(df,lookback=180,tolerance=0.012):
+    d=df.tail(lookback).copy(); hi=d['High'].values; lo=d['Low'].values
+    piv=[]
+    for i in range(2,len(d)-2):
+        if hi[i]>=hi[i-2:i+3].max(): piv.append(('R',float(hi[i])))
+        if lo[i]<=lo[i-2:i+3].min(): piv.append(('S',float(lo[i])))
+    if not piv:return [],[]
+    clusters=[]
+    for typ,p in sorted(piv,key=lambda x:x[1]):
+        placed=False
+        for c in clusters:
+            if abs(p-c['price'])/c['price']<=tolerance and typ==c['type']:
+                c['prices'].append(p); c['price']=float(np.mean(c['prices'])); c['touches']+=1; placed=True; break
+        if not placed: clusters.append({'type':typ,'price':p,'prices':[p],'touches':1})
+    price=float(d['Close'].iloc[-1]); ss=[c for c in clusters if c['type']=='S' and c['price']<price]; rr=[c for c in clusters if c['type']=='R' and c['price']>price]
+    ss=sorted(ss,key=lambda c:(-c['touches'],abs(price-c['price'])))[:3]; rr=sorted(rr,key=lambda c:(-c['touches'],abs(price-c['price'])))[:3]
+    return sorted(ss,key=lambda c:c['price'],reverse=True),sorted(rr,key=lambda c:c['price'])
 
-def levels(d,tol=.012):
-    p=float(d.Close.iloc[-1])
-    def cluster(points):
-        cs=[]
-        for _,v in sorted(points,key=lambda x:x[1]):
-            hit=next((c for c in cs if abs(v-c[0])/c[0]<=tol),None)
-            if hit:hit[1].append(v);hit[0]=float(np.mean(hit[1]))
-            else:cs.append([v,[v]])
-        return cs
-    s=sorted([c[0] for c in cluster(piv(d.Low,'low')) if c[0]<p],reverse=True); r=sorted([c[0] for c in cluster(piv(d.High,'high')) if c[0]>p])
-    return s,r
+def chart(df,supports,resists,symbol):
+    if go is None:return
+    d=df.tail(220); fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[.78,.22],vertical_spacing=.03)
+    fig.add_trace(go.Candlestick(x=d.index,open=d.Open,high=d.High,low=d.Low,close=d.Close,name='K線'),row=1,col=1)
+    for n in [20,60,120]:
+        if f'MA{n}' in d: fig.add_trace(go.Scatter(x=d.index,y=d[f'MA{n}'],name=f'MA{n}',mode='lines'),row=1,col=1)
+    for c in supports:
+        fig.add_hline(y=c['price'],line_dash='dot',annotation_text=f"S {c['price']:.2f} ×{c['touches']}",row=1,col=1)
+    for c in resists:
+        fig.add_hline(y=c['price'],line_dash='dot',annotation_text=f"R {c['price']:.2f} ×{c['touches']}",row=1,col=1)
+    fig.add_trace(go.Bar(x=d.index,y=d.Volume,name='成交量'),row=2,col=1)
+    fig.update_layout(height=650,margin=dict(l=10,r=10,t=25,b=10),xaxis_rangeslider_visible=False,legend_orientation='h',template='plotly_dark')
+    st.plotly_chart(fig,use_container_width=True,config={'displaylogo':False,'scrollZoom':True})
 
-def analyze(ticker,near=.03,rrmin=1.5,tol=.012):
-    d=data(ticker)
-    if len(d)<130:return None
-    x=d.iloc[-1];s,r=levels(d,tol);s1=s[0] if s else np.nan;r1=r[0] if r else np.nan
-    risk=(x.Close-s1)/x.Close if np.isfinite(s1) else np.nan; reward=(r1-x.Close)/x.Close if np.isfinite(r1) else np.nan
-    rr=reward/risk if np.isfinite(risk) and risk>0 and np.isfinite(reward) else np.nan
-    return {'Ticker':ticker,'Price':float(x.Close),'S1':s1,'R1':r1,'Risk':risk,'Reward':reward,'RR':rr,'Trend':bool(x.Close>x.MA20>x.MA60>x.MA120),'Near':bool(np.isfinite(risk) and risk<=near),'RROK':bool(np.isfinite(rr) and rr>=rrmin),'Vol':float(x.Volume/x.VolMA20),'MA20':float(x.MA20),'MA60':float(x.MA60),'MA120':float(x.MA120)}
+def analyze(symbol,entry=None):
+    q=provider.quote(symbol)
+    df=provider.kline(symbol,'K_DAY',500)
+    if df.empty: df=yf_history(symbol,'2y','1d')
+    if df.empty:return None
+    df=add_indicators(df); ss,rr=levels(df)
+    price=float(q['price']) if q and np.isfinite(q['price']) else float(df['Close'].iloc[-1]); s1=ss[0]['price'] if ss else np.nan; r1=rr[0]['price'] if rr else np.nan
+    e=float(entry) if entry and float(entry)>0 else price
+    risk=e-s1 if np.isfinite(s1) else np.nan; reward=r1-e if np.isfinite(r1) else np.nan
+    rr_ratio=reward/risk if risk>0 and reward>0 else np.nan
+    trend='多頭' if df['MA20'].iloc[-1]>df['MA60'].iloc[-1]>df['MA120'].iloc[-1] else ('空頭' if df['MA20'].iloc[-1]<df['MA60'].iloc[-1]<df['MA120'].iloc[-1] else '盤整')
+    return {'symbol':symbol,'quote':q,'df':df,'supports':ss,'resists':rr,'price':price,'s1':s1,'r1':r1,'rr':rr_ratio,'trend':trend}
 
-def backtest(d,near=.03,rr=1.5,horizon=20):
-    rows=[]
-    for i in range(130,len(d)-horizon-1):
-        h=d.iloc[:i+1];p=float(h.Close.iloc[-1]);s,r=levels(h)
-        if not s or not r or not(p>h.MA20.iloc[-1]>h.MA60.iloc[-1]>h.MA120.iloc[-1]):continue
-        stop=s[0]
-        if (p-stop)/p>near:continue
-        ent=float(d.Open.iloc[i+1]);target=ent+rr*(ent-stop);ex=None;out='timeout'
-        for j in range(i+1,min(i+1+horizon,len(d))):
-            lo,hi=float(d.Low.iloc[j]),float(d.High.iloc[j])
-            if lo<=stop:ex=stop;out='loss';break
-            if hi>=target:ex=target;out='win';break
-        if ex is None:ex=float(d.Close.iloc[min(i+horizon,len(d)-1)])
-        rows.append({'Date':d.index[i],'Entry':ent,'Exit':ex,'Return':ex/ent-1,'Outcome':out})
-    return pd.DataFrame(rows)
+st.markdown('<div class="hero"><h1>📈 US Stock Watch V6</h1><div class="muted">富途行情介面 × K線技術分析 × 自動支撐壓力 × 自動選股</div></div>',unsafe_allow_html=True)
 
-st.markdown('<div class="hero"><h1>📈 美股交易期望值 V5</h1><div class="sub">即時／延遲行情 · 24/5 時段架構 · 技術分析 · 掃描 · 回測 · 期望值</div></div>',unsafe_allow_html=True)
-with st.sidebar:
-    st.header('設定'); period=st.selectbox('歷史資料',['2y','5y','10y','max'],1); near=st.slider('距離支撐 S1 最大',1,10,3)/100; rrmin=st.number_input('最低 Risk/Reward',.5,5.,1.5,.1); tol=st.slider('支撐/壓力聚類',.5,3.,1.2,.1)/100; horizon=st.slider('最長持有日',5,60,20,5)
-    st.divider(); st.caption('即時行情：Alpaca API 優先；未設定金鑰時使用 Yahoo fallback。')
+symbol=st.text_input('🔎 輸入美股代碼',value=st.session_state.get('symbol','NVDA'),placeholder='例如 NVDA / AAPL / TSLA').strip().upper()
+st.session_state['symbol']=symbol
 
-tabs=st.tabs(['⚡ 即時行情','🔎 單股分析','🚀 全市場掃描','📊 回測'])
+with st.spinner('正在載入行情與技術分析…'):
+    a=analyze(symbol)
 
-with tabs[0]:
-    st.subheader('⚡ 即時行情中心')
-    c1,c2,c3=st.columns([2,1,1]); symbol=c1.text_input('股票代號','AAPL',key='live').upper().strip(); session=c2.selectbox('行情時段',['regular','extended','overnight'],format_func=lambda x:{'regular':'正常盤','extended':'盤前／盤後','overnight':'隔夜 24/5'}[x]); refresh=c3.slider('刷新秒數',5,60,10)
-    @st.fragment(run_every=f'{refresh}s')
-    def live_panel():
-        q=live_quote(symbol,session)
-        if not q:st.error('目前無法取得行情。請設定 Alpaca API 金鑰。');return
-        pct=q['pct']; arrow='▲' if pct>=0 else '▼'; cls='positive' if pct>=0 else 'negative'
-        st.markdown(f'<div class="hero"><div class="sub">{symbol} · {q["source"]} · {q["feed"]}</div><div class="price">${q["price"]:,.2f}</div><div>{arrow} {q["change"]:+.2f} ({pct:+.2f}%)</div></div>',unsafe_allow_html=True)
-        a,b,c,d,e,f=st.columns(6); a.metric('Bid',f'${q["bid"]:.2f}' if q['bid'] else '—');b.metric('Ask',f'${q["ask"]:.2f}' if q['ask'] else '—');c.metric('開盤',f'${q["open"]:.2f}' if q['open'] else '—');d.metric('最高',f'${q["high"]:.2f}' if q['high'] else '—');e.metric('最低',f'${q["low"]:.2f}' if q['low'] else '—');f.metric('成交量',f'{q["volume"]:,.0f}' if q['volume'] else '—')
-        st.caption(f'更新：{q["ts"]} · 自動每 {refresh} 秒刷新')
-    live_panel()
-    st.info('24/5 模式依行情供應商的 overnight feed；不同方案可能有即時／延遲差異。')
+if a is None:
+    st.error('找不到這支股票的行情資料。若要使用富途即時行情，請先啟動 OpenD 並登入富途帳號；未連線時系統會嘗試使用 Yahoo 歷史資料。')
+else:
+    q=a['quote']; prev=q.get('prev') if q else np.nan; ch=a['price']-prev if q and prev and np.isfinite(prev) else np.nan; pct=ch/prev*100 if np.isfinite(ch) and prev else np.nan
+    tabs=st.tabs(['📺 看盤','🧠 技術分析','🚀 自動選股','📊 回測'])
+    with tabs[0]:
+        c1,c2,c3,c4,c5=st.columns(5)
+        c1.metric('即時價格',f"${a['price']:.2f}",f"{pct:+.2f}%" if np.isfinite(pct) else None)
+        c2.metric('支撐 S1',f"${a['s1']:.2f}" if np.isfinite(a['s1']) else '—')
+        c3.metric('壓力 R1',f"${a['r1']:.2f}" if np.isfinite(a['r1']) else '—')
+        c4.metric('Risk / Reward',f"1 : {a['rr']:.2f}" if np.isfinite(a['rr']) else '—')
+        c5.metric('趨勢',a['trend'])
+        st.caption(f"行情來源：{q.get('source','Yahoo 歷史/備援')}｜時間：{q.get('time','—') if q else '—'}")
+        chart(a['df'],a['supports'],a['resists'],symbol)
+        st.caption('K線上的 S/R 為系統依歷史價格反覆反應自動聚類出的區域；不是保證未來價格會在該處反轉。')
 
-with tabs[1]:
-    t=st.text_input('美股代號','AAPL',key='single').upper().strip(); c1,c2=st.columns(2); entry=c1.number_input('計畫進場價',.01,100000.,250.,.01); capital=c2.number_input('投入資金',0.,100000000.,10000.,100.)
-    if st.button('開始分析',type='primary',key='singlebtn'):
-        a=analyze(t,near,rrmin,tol); q=live_quote(t,'regular')
-        if not a:st.error('找不到足夠歷史資料。')
-        else:
-            price=q['price'] if q else a['Price']; cols=st.columns(5);cols[0].metric('即時現價',f'${price:,.2f}' if q else f'${a["Price"]:,.2f}');cols[1].metric('S1',f'${a["S1"]:,.2f}' if np.isfinite(a['S1']) else '—');cols[2].metric('R1',f'${a["R1"]:,.2f}' if np.isfinite(a['R1']) else '—');cols[3].metric('R/R',f'1:{a["RR"]:.2f}' if np.isfinite(a['RR']) else '—');cols[4].metric('即時漲跌',f'{q["pct"]:+.2f}%' if q else '—')
-            shares=int(capital/entry);st.write(f'預估股數：{shares:,}｜MA20 ${a["MA20"]:.2f}｜MA60 ${a["MA60"]:.2f}｜MA120 ${a["MA120"]:.2f}｜20日量能 {a["Vol"]:.2f}x');d=data(t,period);st.line_chart(d[['Close','MA20','MA60','MA120']].tail(250))
+    with tabs[1]:
+        d=a['df'].iloc[-1]
+        cols=st.columns(6)
+        for col,n in zip(cols,['MA5','MA10','MA20','MA60','MA120','RSI14']): col.metric(n,f"{d[n]:.2f}" if np.isfinite(d[n]) else '—')
+        st.subheader('自動支撐 / 壓力')
+        x,y=st.columns(2)
+        with x:
+            st.markdown('**支撐區**')
+            st.dataframe(pd.DataFrame([{'價位':c['price'],'反應次數':c['touches']} for c in a['supports']]),hide_index=True,use_container_width=True)
+        with y:
+            st.markdown('**壓力區**')
+            st.dataframe(pd.DataFrame([{'價位':c['price'],'反應次數':c['touches']} for c in a['resists']]),hide_index=True,use_container_width=True)
+        st.subheader('MACD')
+        st.line_chart(a['df'][['MACD','MACDSignal']].tail(120))
 
-with tabs[2]:
-    st.subheader('🚀 即時／技術掃描'); raw=st.text_area('股票清單（每行一檔）','AAPL\nMSFT\nNVDA\nAMZN\nMETA\nGOOGL\nTSLA\nAVGO\nAMD\nNFLX'); workers=st.slider('並行數',1,10,5,key='workers')
-    if st.button('開始掃描',type='primary',key='scanbtn'):
-        syms=list(dict.fromkeys(x.strip().upper() for x in raw.splitlines() if x.strip()));out=[];bar=st.progress(0)
-        from concurrent.futures import ThreadPoolExecutor,as_completed
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            fs={ex.submit(analyze,s,near,rrmin,tol):s for s in syms}
-            for n,f in enumerate(as_completed(fs),1):
-                try:
-                    z=f.result()
-                    if z:
-                        q=live_quote(z['Ticker'],'regular'); z['LivePrice']=q['price'] if q else z['Price']; z['LivePct']=q['pct'] if q else np.nan;out.append(z)
-                except Exception:pass
-                bar.progress(n/len(fs))
-        df=pd.DataFrame(out)
-        if not df.empty:
-            hit=df[df.Trend&df.Near&df.RROK].sort_values(['RR','Reward'],ascending=False);st.metric('符合技術條件',len(hit));st.dataframe(hit[['Ticker','LivePrice','LivePct','S1','R1','Risk','Reward','RR','Vol']],use_container_width=True,hide_index=True);st.download_button('下載 CSV',hit.to_csv(index=False).encode('utf-8-sig'),'v5_scan.csv','text/csv')
-        else:st.warning('沒有有效資料。')
+    with tabs[2]:
+        st.subheader('🚀 自動選股條件')
+        col=st.columns(4)
+        min_rr=col[0].number_input('最低 R/R',1.0,10.0,2.0,.5)
+        max_dist=col[1].number_input('距離支撐最大 %',1.0,30.0,6.0,1.0)
+        min_vol=col[2].number_input('量 / 20日均量 ≥',0.5,10.0,1.2,.1)
+        only_bull=col[3].checkbox('只看多頭排列',True)
+        symbols=st.text_area('掃描股票（每行或逗號分隔）','NVDA\nAAPL\nMSFT\nAMZN\nMETA\nTSLA\nAMD\nAVGO\nPLTR\nGOOGL').replace(',','\n')
+        if st.button('開始掃描',type='primary'):
+            rows=[]
+            for s in [x.strip().upper() for x in symbols.splitlines() if x.strip()]:
+                z=analyze(s)
+                if not z:continue
+                dd=z['df'].iloc[-1]; dist=(z['price']-z['s1'])/z['price']*100 if np.isfinite(z['s1']) else np.nan; volr=dd['Volume']/dd['VolMA20'] if dd['VolMA20'] else np.nan
+                ok_rr=np.isfinite(z['rr']) and z['rr']>=min_rr; ok_dist=np.isfinite(dist) and dist<=max_dist; ok_vol=np.isfinite(volr) and volr>=min_vol; ok_tr=(z['trend']=='多頭') if only_bull else True
+                if ok_rr and ok_dist and ok_vol and ok_tr: rows.append({'股票':s,'價格':z['price'],'S1':z['s1'],'R1':z['r1'],'距支撐%':dist,'量比':volr,'R/R':z['rr'],'趨勢':z['trend']})
+            out=pd.DataFrame(rows).sort_values('R/R',ascending=False) if rows else pd.DataFrame()
+            st.session_state['scan']=out
+        if 'scan' in st.session_state:
+            st.dataframe(st.session_state['scan'],hide_index=True,use_container_width=True)
 
-with tabs[3]:
-    t2=st.text_input('回測代號','AAPL',key='bt').upper().strip()
-    if st.button('執行回測',type='primary',key='btbtn'):
-        d=data(t2,period);bt=backtest(d,near,rrmin,horizon)
-        if bt.empty:st.warning('沒有符合條件的歷史案例。')
-        else:
-            w=bt.Return>0;wr=w.mean();aw=bt.loc[w,'Return'].mean() if w.any() else 0;al=-bt.loc[~w,'Return'].mean() if (~w).any() else 0;ex=wr*aw-(1-wr)*al;eq=(1+bt.Return).cumprod();dd=(eq/eq.cummax()-1).min();c=st.columns(5);c[0].metric('案例',len(bt));c[1].metric('勝率',f'{wr*100:.2f}%');c[2].metric('平均獲利',f'{aw*100:.2f}%');c[3].metric('平均虧損',f'{al*100:.2f}%');c[4].metric('期望值',f'{ex*100:.2f}%');st.metric('最大回撤',f'{dd*100:.2f}%');st.dataframe(bt.tail(100),use_container_width=True,hide_index=True);st.download_button('下載回測 CSV',bt.to_csv(index=False).encode('utf-8-sig'),f'{t2}_backtest.csv','text/csv')
+    with tabs[3]:
+        st.subheader('📊 歷史條件回測')
+        st.info('V6 先保留 V5 的研究型回測介面；下一階段可把同一套自動 S/R 規則直接用於無未來資料洩漏的歷史回測。')
+        entry=st.number_input('假設進場價',min_value=0.01,value=float(a['price']),step=.1)
+        if np.isfinite(a['s1']) and np.isfinite(a['r1']):
+            st.write(f"自動停損參考：**${a['s1']:.2f}**｜目標參考：**${a['r1']:.2f}**｜R/R：**1 : {a['rr']:.2f}**")
+        st.caption('此頁的數字是歷史資料分析結果，不代表未來報酬或勝率。')
 
-st.divider();st.caption('V5：即時行情由 Alpaca 優先提供；未設定金鑰時保留 Yahoo fallback。即時資料的覆蓋範圍、延遲與費用取決於行情供應商方案。技術分析與回測僅供研究。')
+with st.expander('⚙️ 富途 OpenD 連線設定'):
+    st.write(f'目前設定：{FUTU_HOST}:{FUTU_PORT}')
+    st.write('要使用富途即時行情與即時 K 線，請在網站伺服器上啟動 OpenD、登入富途帳號，並讓本網站可以連到該 OpenD。未連線時，V6 會退回 Yahoo 歷史資料。')
